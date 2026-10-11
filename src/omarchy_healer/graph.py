@@ -18,7 +18,7 @@ from .models import (
     SymptomEvent,
     VerificationReport,
 )
-from .playbooks import PLAYBOOK_CATALOG, execute_playbook
+from .playbooks import PLAYBOOK_CATALOG, execute_playbook, send_completion_notification
 from .probes import collect_all_symptoms
 
 
@@ -280,6 +280,13 @@ class OmarchyHealerOrchestrator:
                 ),
                 remaining_anomalies=len(current_events),
             )
+
+        if report.resolved and execution.executed:
+            notified = send_completion_notification(
+                symptom.title,
+                f"Fixed via {execution.playbook_id}: {report.post_check_summary}",
+            )
+            trace.append(f"[Notifier] desktop_notification_sent={notified}")
 
         trace.append(
             f"[Verifier] resolved={report.resolved} summary={report.post_check_summary!r}"

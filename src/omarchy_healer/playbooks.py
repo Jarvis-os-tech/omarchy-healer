@@ -74,6 +74,22 @@ def _exec(cmd: list[str], *, timeout: float = 10.0) -> tuple[int, str, str]:
         return 127, "", str(exc)
 
 
+def send_completion_notification(title: str, body: str) -> bool:
+    """Send a desktop notification when Omarchy-Healer finishes resolving an issue."""
+    rc, _, _ = _exec(
+        [
+            "notify-send",
+            "-a",
+            "omarchy-action",
+            "-t",
+            "5000",
+            f"Omarchy Healer: {title}",
+            body,
+        ],
+        timeout=3.0,
+    )
+    return rc == 0
+
 def execute_playbook(playbook_id: str, args: dict[str, Any] | None = None) -> ExecutionResult:
     """Execute a registered remediation playbook safely and return an ExecutionResult."""
     args = args or {}
