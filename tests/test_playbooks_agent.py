@@ -588,3 +588,56 @@ def test_bin_on_improve_exists_and_is_executable() -> None:
     assert mode & stat.S_IXUSR
 
 
+def test_free_disk_space_playbook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_exec(cmd: list[str], **_kw: Any) -> tuple[int, str, str]:
+        calls.append(cmd)
+        return 0, "Vacuumed 20MB", ""
+
+    fake_cache = tmp_path / ".cache" / "thumbnails"
+    fake_cache.mkdir(parents=True)
+    fake_thumb = fake_cache / "test.png"
+    fake_thumb.write_bytes(b"x" * 1024)
+
+    monkeypatch.setattr(playbooks, "_exec", fake_exec)
+    monkeypatch.setattr(playbooks.Path, "home", lambda: tmp_path)
+
+    res = execute_playbook("free_disk_space", {"path": "/"})
+    assert res.executed is True
+    assert res.success is True
+    assert any("journalctl" in c[0] for c in calls)
+    assert not fake_thumb.exists()
+
+
+def test_restart_pipewire_playbook(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_exec(cmd: list[str], **_kw: Any) -> tuple[int, str, str]:
+        calls.append(cmd)
+        return 0, "Restarted", ""
+
+    monkeypatch.setattr(playbooks, "_exec", fake_exec)
+    res = execute_playbook("restart_pipewire")
+    assert res.executed is True
+    assert res.success is True
+    assert any("pipewire" in " ".join(c) for c in calls)
+
+
+def test_reconnect_network_playbook(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_exec(cmd: list[str], **_kw: Any) -> tuple[int, str, str]:
+        calls.append(cmd)
+        return 0, "Online", ""
+
+    monkeypatch.setattr(playbooks, "_exec", fake_exec)
+    monkeypatch.setattr(playbooks.shutil, "which", lambda cmd: "/usr/bin/nmcli" if cmd == "nmcli" else None)
+
+    res = execute_playbook("reconnect_network")
+    assert res.executed is True
+    assert res.success is True
+    assert any("networking" in c for c in calls)
+
+
+

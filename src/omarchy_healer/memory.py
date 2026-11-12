@@ -141,6 +141,21 @@ class IncidentMemoryStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def find_recent_failures(self, fingerprint: str, *, limit: int = 3) -> list[str]:
+        """Return distinct recently executed and unresolved/failed playbooks for a fingerprint."""
+        with self._session() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT playbook_id
+                FROM incidents
+                WHERE fingerprint = ? AND executed = 1 AND resolved = 0
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (fingerprint, limit),
+            ).fetchall()
+            return [str(row[0]) for row in rows if row[0]]
+
     def record_state(self, state: HealerGraphState) -> int:
         """Persist one incident row from a healer graph state and return its new row id."""
         symptom = state.get("symptom") or {}

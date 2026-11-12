@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -746,22 +747,193 @@ class MemoryProcessProbe:
         return zombies
 
 
+class DiskSpaceProbe:
+    """Monitors filesystem storage utilization on critical mounts (/, /home, /tmp)."""
+
+    name = "disk_space"
+
+    def __init__(self, config: HealerConfig) -> None:
+        self.config = config
+
+    def check(self) -> list[SymptomEvent]:
+        events: list[SymptomEvent] = []
+        mounts_to_check: list[Path] = [Path("/"), Path.home()]
+        tmp_dir = Path("/tmp")
+        if tmp_dir.is_dir():
+            mounts_to_check.append(tmp_dir)
+
+        checked_devs: set[int] = set()
+
+        for mount in mounts_to_check:
+            if not mount.exists():
+                continue
+            try:
+                st = mount.stat()
+                dev_id = st.st_dev
+                if dev_id in checked_devs:
+                    continue
+                checked_devs.add(dev_id)
+                usage = shutil.disk_usage(mount)
+            except OSError:
+                continue
+
+            total_gb = usage.total / (1024**3)
+            free_gb = usage.free / (1024**3)
+            used_pct = round(((usage.total - usage.free) / usage.total) * 100.0, 1) if usage.total > 0 else 0.0
+
+            is_crit = used_pct >= self.config.disk_crit_percent
+            is_warn = used_pct >= self.config.disk_warn_percent
+
+            if is_warn or is_crit:
+                path_str = str(mount)
+                severity_str = "Critical" if is_crit else "Elevated"
+                events.append(
+                    SymptomEvent.create(
+                        probe_name=self.name,
+                        domain="disk",
+                        fingerprint_key=f"disk_full:{path_str}",
+                        title=f"{severity_str} Disk Usage on {path_str} ({used_pct:.1f}%)",
+                        summary=(
+                            f"Filesystem at {path_str} is {used_pct:.1f}% full "
+                            f"({free_gb:.1f} GiB free of {total_gb:.1f} GiB)."
+                        ),
+                        metrics={
+                            "mount": path_str,
+                            "used_percent": used_pct,
+                            "free_gb": round(free_gb, 1),
+                            "total_gb": round(total_gb, 1),
+                            "critical": is_crit,
+                        },
+                        suggested_playbook="free_disk_space",
+                        suggested_args={"path": path_str},
+                        default_tier=1,
+                    )
+                )
+
+        return events
+
+
+class AudioServiceProbe:
+    """Monitors PipeWire and WirePlumber user audio stack health."""
+
+    name = "audio_service"
+
+    def __init__(self, config: HealerConfig) -> None:
+        self.config = config
+
+    def check(self) -> list[SymptomEvent]:
+        events: list[SymptomEvent] = []
+        if not (
+            os.environ.get("WAYLAND_DISPLAY")
+            or os.environ.get("DISPLAY")
+            or Path(f"/run/user/{os.getuid()}/hypr").exists()
+        ):
+            return events
+
+        core_units = ["pipewire.service", "wireplumber.service"]
+        failed_units: list[str] = []
+        for unit in core_units:
+            rc_fail, _, _ = run_cmd(["systemctl", "--user", "is-failed", unit])
+            if rc_fail == 0:
+                failed_units.append(unit)
+                continue
+            rc_active, out_act, _ = run_cmd(["systemctl", "--user", "is-active", unit])
+            if rc_active != 0 or out_act != "active":
+                failed_units.append(unit)
+
+        if failed_units:
+            events.append(
+                SymptomEvent.create(
+                    probe_name=self.name,
+                    domain="audio",
+                    fingerprint_key=f"audio_units_failed:{','.join(sorted(failed_units))}",
+                    title=f"PipeWire Audio Service Degraded ({', '.join(failed_units)})",
+                    summary=(
+                        f"User audio service(s) {', '.join(failed_units)} are not running or in failed state; "
+                        "sound output is unavailable."
+                    ),
+                    metrics={"failed_units": failed_units},
+                    suggested_playbook="restart_pipewire",
+                    default_tier=1,
+                )
+            )
+
+        return events
+
+
+class NetworkConnectivityProbe:
+    """Monitors default route and network connectivity reachability."""
+
+    name = "network_connectivity"
+
+    def __init__(self, config: HealerConfig) -> None:
+        self.config = config
+        self._consecutive_failures = 0
+
+    def check(self) -> list[SymptomEvent]:
+        events: list[SymptomEvent] = []
+        rc_route, out_route, _ = run_cmd(["ip", "route", "show", "default"])
+        has_default_route = (rc_route == 0 and bool(out_route.strip()))
+
+        can_connect = False
+        if has_default_route:
+            for host, port in [("1.1.1.1", 53), ("8.8.8.8", 53)]:
+                try:
+                    s = socket.create_connection((host, port), timeout=1.0)
+                    s.close()
+                    can_connect = True
+                    break
+                except OSError:
+                    continue
+
+        if not has_default_route or not can_connect:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 2:
+                events.append(
+                    SymptomEvent.create(
+                        probe_name=self.name,
+                        domain="network",
+                        fingerprint_key="network_disconnected",
+                        title="Network Connectivity Lost",
+                        summary=(
+                            f"Host has lost default gateway route or DNS reachability "
+                            f"(has_default_route={has_default_route})."
+                        ),
+                        metrics={
+                            "has_default_route": has_default_route,
+                            "consecutive_failures": self._consecutive_failures,
+                        },
+                        suggested_playbook="reconnect_network",
+                        default_tier=1,
+                    )
+                )
+        else:
+            self._consecutive_failures = 0
+
+        return events
+
+
 class _ProbeSet:
     """Long-lived probe instances for one configuration, so per-sweep state survives."""
 
-    __slots__ = ("ui", "mcp", "memory", "crash")
+    __slots__ = ("ui", "mcp", "memory", "crash", "disk", "audio", "network")
 
     def __init__(self, config: HealerConfig) -> None:
         self.ui = OmarchyUiProbe(config)
         self.mcp = McpAndServiceProbe(config)
         self.memory = MemoryProcessProbe(config)
         self.crash = CoreDumpProbe(config)
+        self.disk = DiskSpaceProbe(config)
+        self.audio = AudioServiceProbe(config)
+        self.network = NetworkConnectivityProbe(config)
 
 
 _PROBE_CACHE_KEY_FIELDS: tuple[str, ...] = (
     "mcp_config_path",
     "ram_warn_percent",
     "ram_crit_percent",
+    "disk_warn_percent",
+    "disk_crit_percent",
     "psi_some_avg10_warn",
     # CoreDumpProbe derives its shared claim file from the incidents DB path.
     "db_path",
@@ -795,6 +967,7 @@ def reset_probe_cache() -> None:
     _PROBE_CACHE.clear()
     reset_acknowledged_zombies()
 
+
 def collect_all_symptoms(
     config: HealerConfig, *, osd_stuck_seconds: float = DEFAULT_OSD_STUCK_SECONDS
 ) -> list[SymptomEvent]:
@@ -806,4 +979,7 @@ def collect_all_symptoms(
     events.extend(probes.mcp.check())
     events.extend(probes.memory.check())
     events.extend(probes.crash.check())
+    events.extend(probes.disk.check())
+    events.extend(probes.audio.check())
+    events.extend(probes.network.check())
     return events

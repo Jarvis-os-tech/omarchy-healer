@@ -12,6 +12,9 @@ DomainType = Literal[
     "systemd_service",
     "memory_pressure",
     "compositor",
+    "disk",
+    "network",
+    "audio",
     "other",
 ]
 

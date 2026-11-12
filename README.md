@@ -7,13 +7,22 @@ Multi-agent system monitor and self-healing orchestrator for Omarchy / Hyprland 
    - `OmarchyUiProbe`: Detects stuck `omarchy-osd` layer overlays (e.g., `duration: 0` launch popups), missing `omarchy-bar` Quickshell surfaces, and `hyprctl configerrors`.
    - `McpAndServiceProbe`: Validates `~/.omp/agent/mcp.json` server binaries (`ENOENT` detection) and `systemctl --user --failed` units.
    - `MemoryProcessProbe`: Monitors `/proc/meminfo`, `/proc/pressure/memory` (PSI), top RSS consumers, and defunct zombie processes.
+   - `CoreDumpProbe`: Journald systemd-coredump watcher with cross-process claim cursor and deduplication.
+   - `DiskSpaceProbe`: Proactively monitors filesystem utilization across `/`, `/home`, and `/tmp` with configurable warning (85%) and critical (95%) thresholds.
+   - `AudioServiceProbe`: Detects degraded or crashed PipeWire / WirePlumber user audio services in active desktop sessions.
+   - `NetworkConnectivityProbe`: Monitors default gateway route and DNS connectivity reachability with consecutive failure gating.
 
 2. **Triage & Safety Judge (`laya_judge.py`)**
    - **Primary**: NVIDIA NIM (`NVIDIA_NIM_API_KEY` via `langchain-openai` against `https://integrate.api.nvidia.com/v1`).
    - **Fallback 1**: Google Gemini (`GEMINI_API_KEY` via `langchain-google-genai`).
    - **Fallback 2**: Calibrated deterministic rule matcher when offline.
+
 3. **LangGraph Multi-Agent Workflow (`graph.py`)**
-   - `triage` -> `diagnostician` -> `planner` -> `safety_gate` -> `executor` -> `verifier` -> `capability_escalator` (when an issue fails remediation or lacks a registered playbook/autonomy tier) -> `record_memory` (SQLite `~/.local/share/omarchy-healer/incidents.db`).
+   - `triage` -> `diagnostician` -> `planner` -> `safety_gate` -> `executor` (with automatic alternative playbook retry) -> `verifier` -> `capability_escalator` -> `record_memory` (SQLite `incidents.db` + failure-learning history).
+
+4. **Persistent Suppression & Graceful Lifecycle (`cli.py`)**
+   - Persists suppression tracking to `suppressor_state.json` so service restarts and OOM recoveries never cause notification storms or repeated execution.
+   - Handles `SIGTERM` and `SIGINT` gracefully with prompt state flushing.
 ## Quick Start
 
 ```bash
@@ -46,7 +55,7 @@ uv run omarchy-healer improve <incident_id>
 | Tier | Meaning | Auto-approved at `--max-tier 1` |
 | ---- | ------- | ------------------------------- |
 | 0 | Silent, no-op-ish (`close_stuck_osd`, `reclaim_memory_caches`, `inspect_only`) | yes |
-| 1 | Mutating but reversible (`restart_systemd_user_unit`, `reload_hyprland_config`, `reap_zombie_parents`, `repair_or_disable_mcp_server`) | yes |
+| 1 | Mutating but reversible (`restart_systemd_user_unit`, `reload_hyprland_config`, `reap_zombie_parents`, `repair_or_disable_mcp_server`, `free_disk_space`, `restart_pipewire`, `reconnect_network`, `restart_notification_daemon`) | yes |
 | 2 | Disruptive or destructive (`restart_omarchy_shell`, `quarantine_mcp_server`) | **no** — needs `--max-tier 2` or manual approval |
 
 Two things deliberately refuse to act on their own:

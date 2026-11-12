@@ -1,0 +1,23 @@
+[Unit]
+Description=Omarchy-Healer watchdog (multi-agent system monitor and autonomous auto-healer)
+Documentation=https://github.com/Jarvis-os-tech/omarchy-healer
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/omarchy-healer/.venv/bin/omarchy-healer watch --interval 30 --auto-heal --max-tier 1
+Restart=always
+RestartSec=10s
+TimeoutStopSec=15
+
+# Resource safety bounds: healer must remain lean and never exhaust desktop resources
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=30%
+LimitNOFILE=4096
+
+[Install]
+WantedBy=graphical-session.target

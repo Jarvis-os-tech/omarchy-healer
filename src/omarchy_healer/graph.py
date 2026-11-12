@@ -50,7 +50,15 @@ MAX_DIAGNOSTIC_TOOL_CHARS = 800
 CROSS_DOMAIN_PLAYBOOKS: frozenset[str] = frozenset({"inspect_only"})
 CROSS_DOMAIN_ALLOWED: dict[str, frozenset[str]] = {
     "compositor": frozenset({"ui_shell"}),
-    "systemd_service": frozenset({"other"}),
+    "systemd_service": frozenset({"other", "audio"}),
+    "audio": frozenset({"systemd_service"}),
+}
+
+ALTERNATIVE_PLAYBOOKS: dict[str, list[str]] = {
+    "reclaim_memory_caches": ["clean_user_memory_caches"],
+    "clean_user_memory_caches": ["reclaim_memory_caches"],
+    "reload_hyprland_config": ["restart_omarchy_shell"],
+    "repair_or_disable_mcp_server": ["quarantine_mcp_server"],
 }
 
 _DIAGNOSTIC_TOOLS_BY_NAME: dict[str, Any] = {tool.name: tool for tool in DIAGNOSTIC_TOOLS}
@@ -62,6 +70,9 @@ DOMAIN_DIAGNOSTIC_TOOLS: dict[str, tuple[str, ...]] = {
     "compositor": ("inspect_omarchy_osd_and_layers",),
     "mcp_config": ("inspect_mcp_config",),
     "memory_pressure": ("inspect_memory_and_top_processes",),
+    "disk": (),
+    "network": (),
+    "audio": (),
 }
 
 
@@ -412,6 +423,12 @@ class OmarchyHealerOrchestrator:
             pb for pb in unique_candidates if _symptom_playbook_compatible(symptom, pb)[0]
         ]
         actionable_compatible = [pb for pb in compatible if pb != "inspect_only"]
+        recent_failures = self.memory.find_recent_failures(symptom.fingerprint)
+        if len(actionable_compatible) > 1 and recent_failures:
+            unfailed = [pb for pb in actionable_compatible if pb not in recent_failures]
+            if unfailed:
+                actionable_compatible = unfailed
+                trace.append(f"[Diagnostician:failure_learning] avoiding recent failures={recent_failures}")
         rejected = [
             f"{pb} ({_symptom_playbook_compatible(symptom, pb)[1]})"
             for pb in unique_candidates
@@ -607,6 +624,8 @@ class OmarchyHealerOrchestrator:
         return "skip"
     def executor_node(self, state: HealerGraphState) -> dict[str, Any]:
         plan = RemediationPlan.model_validate(state["plan"])
+        symptom = SymptomEvent.model_validate(state["symptom"])
+        max_tier = _clamp_int(state.get("max_auto_tier"), self.config.max_auto_tier)
         trace = list(state.get("agent_trace") or [])
 
         result = self.playbook_runner(plan.playbook_id, plan.playbook_args)
@@ -614,7 +633,31 @@ class OmarchyHealerOrchestrator:
             f"[Executor] playbook={result.playbook_id} success={result.success} "
             f"duration_ms={result.duration_ms} out={result.stdout[:80]!r}"
         )
+
+        if not result.success:
+            alternatives = ALTERNATIVE_PLAYBOOKS.get(plan.playbook_id, [])
+            for alt_id in alternatives:
+                if alt_id not in PLAYBOOK_CATALOG:
+                    continue
+                alt_meta = PLAYBOOK_CATALOG[alt_id]
+                alt_tier = int(alt_meta.get("tier", 1))
+                if alt_tier <= max_tier and domain_compatible(symptom.domain, alt_id)[0]:
+                    trace.append(
+                        f"[Executor:retry] attempting alternative playbook {alt_id} (tier {alt_tier})"
+                    )
+                    alt_result = self.playbook_runner(alt_id, plan.playbook_args)
+                    trace.append(
+                        f"[Executor:retry] alternative={alt_id} success={alt_result.success} "
+                        f"out={alt_result.stdout[:80]!r}"
+                    )
+                    if alt_result.success:
+                        result = alt_result
+                        plan.playbook_id = alt_id
+                        plan.safety_tier = alt_tier
+                        break
+
         return {
+            "plan": plan.model_dump(),
             "execution": result.model_dump(),
             "status": "executed" if result.success else "execution_failed",
             "agent_trace": trace,

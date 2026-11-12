@@ -766,3 +766,27 @@ def test_cli_improve_fallback_when_no_agent_binary(tmp_path: Path, monkeypatch: 
     assert "spec_pb" in out
 
 
+def test_watch_suppressor_persists_and_restores_state(tmp_path: Path) -> None:
+    clock = _FakeClock(1000.0)
+    state_file = tmp_path / "suppressor_state.json"
+    s1 = WatchSuppressor(interval=15.0, clock=clock, state_path=state_file)
+    sym = _symptom(fingerprint_key="unit:foo.service")
+
+    assert s1.should_process(sym) is True
+    s1.record(_state(sym, executed=True, resolved=False))
+    # Symptom failed once, backoff is 15s
+    assert s1.should_process(sym) is False
+    assert s1.save_state() is True
+    assert state_file.is_file()
+
+    # Recreate suppressor simulating process restart
+    s2 = WatchSuppressor(interval=15.0, clock=clock, state_path=state_file)
+    assert s2.should_process(sym) is False
+    assert s2.failure_count(sym.fingerprint) == 1
+
+    # Advance clock past backoff
+    clock.advance(20.0)
+    assert s2.should_process(sym) is True
+
+
+

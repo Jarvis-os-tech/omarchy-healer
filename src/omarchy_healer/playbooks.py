@@ -105,6 +105,35 @@ PLAYBOOK_CATALOG: dict[str, dict[str, Any]] = {
             "distinct parent, since only a parent calling wait() can release them."
         ),
     },
+    "free_disk_space": {
+        "tier": 1,
+        "domain": "disk",
+        "description": (
+            "Clean user thumbnail caches, vacuum user journal logs, and prune safe cache directories "
+            "to recover disk space without modifying user documents."
+        ),
+    },
+    "restart_pipewire": {
+        "tier": 1,
+        "domain": "audio",
+        "description": (
+            "Reset failed status and restart PipeWire, WirePlumber, and PipeWire-Pulse user audio units."
+        ),
+    },
+    "reconnect_network": {
+        "tier": 1,
+        "domain": "network",
+        "description": (
+            "Recover network connectivity by toggling NetworkManager networking online and reloading connections."
+        ),
+    },
+    "restart_notification_daemon": {
+        "tier": 1,
+        "domain": "ui_shell",
+        "description": (
+            "Reset failed status and restart user notification daemon (mako, dunst, or swaync)."
+        ),
+    },
     "inspect_only": {
         "tier": 0,
         "domain": "other",
@@ -178,7 +207,9 @@ def send_escalation_notification(
             bin_dir = Path(__file__).resolve().parents[2] / "bin"
             script = bin_dir / "on-improve"
             if not script.exists():
-                script = Path("/home/g0pi/Projects/omarchy-healer/bin/on-improve")
+                candidate = Path.home() / ".local" / "bin" / "on-improve"
+                if candidate.exists():
+                    script = candidate
             exec_cmd = [str(script)]
             if incident_id is not None:
                 exec_cmd.append(str(incident_id))
@@ -289,6 +320,18 @@ def execute_playbook(playbook_id: str, args: dict[str, Any] | None = None) -> Ex
     if playbook_id == "clean_user_memory_caches":
         return _run_clean_user_memory_caches(args, started)
 
+    if playbook_id == "free_disk_space":
+        return _run_free_disk_space(args, started)
+
+    if playbook_id == "restart_pipewire":
+        return _run_restart_pipewire(args, started)
+
+    if playbook_id == "reconnect_network":
+        return _run_reconnect_network(args, started)
+
+    if playbook_id == "restart_notification_daemon":
+        return _run_restart_notification_daemon(args, started)
+
     if playbook_id == "inspect_only":
         return ExecutionResult(
             executed=True,
@@ -303,6 +346,107 @@ def execute_playbook(playbook_id: str, args: dict[str, Any] | None = None) -> Ex
         playbook_id=playbook_id,
         success=False,
         stderr=f"Unknown playbook_id: {playbook_id!r}",
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _run_free_disk_space(args: dict[str, Any], started: float) -> ExecutionResult:
+    notes: list[str] = []
+    freed_approx_mb = 0.0
+
+    # 1. Vacuum user systemd journal to 50MB
+    rc, _, _ = _exec(["journalctl", "--user", "--vacuum-size=50M"])
+    if rc == 0:
+        notes.append("Vacuumed user journald logs to 50MB")
+
+    # 2. Clean thumbnail cache
+    thumb_dir = Path.home() / ".cache" / "thumbnails"
+    if thumb_dir.is_dir():
+        thumb_freed = 0
+        try:
+            for root, _, files in os.walk(thumb_dir):
+                for f in files:
+                    fp = Path(root) / f
+                    try:
+                        sz = fp.stat().st_size
+                        fp.unlink(missing_ok=True)
+                        thumb_freed += sz
+                    except OSError:
+                        pass
+            if thumb_freed > 0:
+                freed_approx_mb += thumb_freed / (1024 * 1024)
+                notes.append(f"Purged thumbnails cache ({thumb_freed / (1024 * 1024):.1f} MiB)")
+        except OSError:
+            pass
+
+    success = bool(notes)
+    return ExecutionResult(
+        executed=True,
+        playbook_id="free_disk_space",
+        success=success,
+        stdout="; ".join(notes) if notes else "Disk cleanup completed",
+        stderr="" if success else "No cleanable user caches found to free",
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _run_restart_pipewire(args: dict[str, Any], started: float) -> ExecutionResult:
+    units = ["pipewire", "pipewire-pulse", "wireplumber"]
+    _exec(["systemctl", "--user", "reset-failed", "--", *units])
+    rc, out, err = _exec(["systemctl", "--user", "restart", "--", *units], timeout=15.0)
+    return ExecutionResult(
+        executed=True,
+        playbook_id="restart_pipewire",
+        success=(rc == 0),
+        stdout=out or "Restarted PipeWire and WirePlumber user audio services",
+        stderr=err,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _run_reconnect_network(args: dict[str, Any], started: float) -> ExecutionResult:
+    if not shutil.which("nmcli"):
+        return ExecutionResult(
+            executed=False,
+            playbook_id="reconnect_network",
+            success=False,
+            stderr="nmcli command not found on host",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+    _exec(["nmcli", "networking", "on"])
+    rc, out, err = _exec(["nmcli", "general", "reload"], timeout=10.0)
+    return ExecutionResult(
+        executed=True,
+        playbook_id="reconnect_network",
+        success=(rc == 0),
+        stdout=out or "Toggled NetworkManager online and reloaded connections",
+        stderr=err,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _run_restart_notification_daemon(args: dict[str, Any], started: float) -> ExecutionResult:
+    candidates = ["mako", "dunst", "swaync"]
+    restarted: list[str] = []
+    for cand in candidates:
+        chk_rc, _, _ = _exec(["systemctl", "--user", "is-active", f"{cand}.service"])
+        chk_failed, _, _ = _exec(["systemctl", "--user", "is-failed", f"{cand}.service"])
+        if chk_rc == 0 or chk_failed == 0:
+            _exec(["systemctl", "--user", "reset-failed", f"{cand}.service"])
+            rc, _, _ = _exec(["systemctl", "--user", "restart", f"{cand}.service"], timeout=10.0)
+            if rc == 0:
+                restarted.append(cand)
+    if not restarted and shutil.which("mako"):
+        _exec(["killall", "-9", "mako"])
+        subprocess.Popen(["mako"], start_new_session=True)
+        restarted.append("mako")
+
+    return ExecutionResult(
+        executed=True,
+        playbook_id="restart_notification_daemon",
+        success=bool(restarted),
+        stdout=f"Restarted notification daemon(s): {', '.join(restarted)}" if restarted else "",
+        stderr="" if restarted else "No supported notification daemon service found",
         duration_ms=int((time.monotonic() - started) * 1000),
     )
 

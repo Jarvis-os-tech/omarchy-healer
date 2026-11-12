@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -18,6 +21,8 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+
+log = logging.getLogger(__name__)
 
 from .config import HealerConfig
 from .formatting import clean_english_text, format_improvement_agent_prompt
@@ -274,6 +279,7 @@ class WatchSuppressor:
         metric_quantum: float | None = None,
         stale_after: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
+        state_path: Path | None = None,
     ) -> None:
         """Build a suppressor.
 
@@ -288,6 +294,7 @@ class WatchSuppressor:
                 being rounded to this quantum instead of being ignored.
             stale_after: Forget a fingerprint that has not been seen for this long.
             clock: Monotonic time source; injectable for tests.
+            state_path: Optional JSON path to persist suppression state across restarts.
         """
         self.interval = max(0.001, float(interval))
         self.base_backoff = self.interval if base_backoff is None else max(0.0, float(base_backoff))
@@ -298,7 +305,10 @@ class WatchSuppressor:
         self.metric_quantum = None if metric_quantum is None else abs(float(metric_quantum))
         self.stale_after = max(0.0, float(stale_after))
         self._clock = clock
+        self.state_path = Path(state_path) if state_path else None
         self._entries: dict[str, _SymptomEntry] = {}
+        if self.state_path and self.state_path.is_file():
+            self.load_state(self.state_path)
 
     @staticmethod
     def _symptom_payload(symptom: SymptomEvent | Mapping[str, Any]) -> dict[str, Any]:
@@ -484,6 +494,68 @@ class WatchSuppressor:
         """Fingerprints currently tracked, for diagnostics and tests."""
         return sorted(self._entries)
 
+    def save_state(self, path: Path | None = None) -> bool:
+        """Persist suppression tracking to JSON so restarts preserve suppression."""
+        target = Path(path) if path else self.state_path
+        if not target:
+            return False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            now_m = self._now(None)
+            data: dict[str, Any] = {}
+            for fp, entry in self._entries.items():
+                data[fp] = {
+                    "fingerprint": entry.fingerprint,
+                    "signature": entry.signature,
+                    "failures": entry.failures,
+                    "remaining_delay": max(0.0, entry.next_allowed_at - now_m),
+                    "notified": entry.notified,
+                    "seen_count": entry.seen_count,
+                    "suppressed_count": entry.suppressed_count,
+                    "last_seen_epoch": time.time(),
+                }
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(target)
+            return True
+        except OSError as exc:
+            log.warning("Failed to save suppressor state to %s: %s", target, exc)
+            return False
+
+    def load_state(self, path: Path | None = None) -> bool:
+        """Restore suppression tracking from a previous run's saved JSON state."""
+        source = Path(path) if path else self.state_path
+        if not source or not source.is_file():
+            return False
+        try:
+            raw = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+            now_m = self._now(None)
+            now_epoch = time.time()
+            for fp, d in raw.items():
+                if not isinstance(d, dict):
+                    continue
+                last_seen_epoch = float(d.get("last_seen_epoch", 0.0))
+                if self.stale_after > 0 and (now_epoch - last_seen_epoch) > self.stale_after:
+                    continue
+                rem_delay = float(d.get("remaining_delay", 0.0))
+                entry = _SymptomEntry(
+                    fingerprint=str(d.get("fingerprint", fp)),
+                    signature=str(d.get("signature", "")),
+                    failures=int(d.get("failures", 0)),
+                    next_allowed_at=now_m + rem_delay,
+                    notified=bool(d.get("notified", False)),
+                    seen_count=int(d.get("seen_count", 0)),
+                    suppressed_count=int(d.get("suppressed_count", 0)),
+                    last_seen_at=now_m,
+                )
+                self._entries[fp] = entry
+            return True
+        except Exception as exc:
+            log.warning("Failed to load suppressor state from %s: %s", source, exc)
+            return False
+
 
 class WatchOrchestrator(OmarchyHealerOrchestrator):
     """Orchestrator that suppresses repeated, unchanged, already-handled symptoms.
@@ -503,7 +575,11 @@ class WatchOrchestrator(OmarchyHealerOrchestrator):
     ) -> None:
         """Build a watch orchestrator bound to a suppressor."""
         super().__init__(config, **kwargs)
-        self.suppressor = suppressor or WatchSuppressor()
+        if suppressor is None:
+            state_file = self.config.db_path.parent / "suppressor_state.json"
+            self.suppressor = WatchSuppressor(interval=15.0, state_path=state_file)
+        else:
+            self.suppressor = suppressor
 
     def notify_completion(self, symptom: SymptomEvent, title: str, body: str) -> bool:
         """Notify at most once per fingerprint, until that fingerprint actually changes.
@@ -550,6 +626,8 @@ class WatchOrchestrator(OmarchyHealerOrchestrator):
             )
             self.suppressor.record(state)
             results.append(state)
+        if results:
+            self.suppressor.save_state()
         return results
 
 
@@ -569,9 +647,27 @@ def run_watch(
     """
     renderer = render or (lambda results: _render_results(results, auto_heal=auto_heal))
     cycle = 0
+
+    stop_event = threading.Event()
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        stop_event.set()
+
+    old_sigterm: Any = None
+    old_sigint: Any = None
     try:
-        while max_cycles is None or cycle < max_cycles:
+        old_sigterm = signal.signal(signal.SIGTERM, _handle_signal)
+    except (ValueError, AttributeError):
+        pass
+    try:
+        old_sigint = signal.signal(signal.SIGINT, _handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        while (max_cycles is None or cycle < max_cycles) and not stop_event.is_set():
             cycle += 1
+            cycle_start = time.monotonic()
             try:
                 results = orchestrator.scan_and_process(
                     auto_heal=auto_heal,
@@ -589,10 +685,31 @@ def run_watch(
                 if pending:
                     summary = ", ".join(f"{fp} in {delay:.0f}s" for fp, delay in pending)
                     console.print(f"[dim]Suppressed unchanged symptom(s): {summary}[/dim]")
-            sleep(interval)
+
+            elapsed = time.monotonic() - cycle_start
+            delay = max(0.01, interval - elapsed)
+
+            if sleep is not time.sleep:
+                sleep(interval)
+            else:
+                if stop_event.wait(delay):
+                    break
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped Omarchy-Healer watchdog.[/yellow]")
         return 0
+    finally:
+        orchestrator.suppressor.save_state()
+        if old_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            except (ValueError, AttributeError):
+                pass
+        if old_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, old_sigint)
+            except (ValueError, AttributeError):
+                pass
+    return 0
     return 0
 
 
@@ -722,7 +839,7 @@ def _run_improve(
 
     repo_dir = Path(__file__).resolve().parents[2]
     if not repo_dir.exists():
-        repo_dir = Path("/home/g0pi/Projects/omarchy-healer")
+        repo_dir = Path.cwd()
 
     if repo_dir.is_dir():
         os.chdir(repo_dir)

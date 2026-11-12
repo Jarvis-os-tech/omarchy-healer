@@ -882,4 +882,70 @@ def test_completion_notification_is_pure_english_without_json(
     assert "Stuck Omarchy OSD Overlay Popup" in body
 
 
+def test_executor_retries_with_alternative_playbook(tmp_path: Path) -> None:
+    executed_pbs: list[str] = []
+
+    def mock_runner(pb_id: str, _args: dict[str, Any]) -> ExecutionResult:
+        executed_pbs.append(pb_id)
+        # Fail the first one (reclaim_memory_caches), succeed on alternative (clean_user_memory_caches)
+        if pb_id == "reclaim_memory_caches":
+            return ExecutionResult(executed=True, playbook_id=pb_id, success=False, stderr="failed", duration_ms=1)
+        return ExecutionResult(executed=True, playbook_id=pb_id, success=True, stdout="cleaned", duration_ms=1)
+
+    symptom = SymptomEvent.create(
+        probe_name="memory_and_process",
+        domain="memory_pressure",
+        fingerprint_key="high_ram_test",
+        title="Elevated RAM",
+        summary="RAM high",
+        suggested_playbook="reclaim_memory_caches",
+        default_tier=0,
+    )
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        probe_runner=_CountingProbeRunner([]),
+        playbook_runner=mock_runner,
+    )
+
+    state = orchestrator.process_symptom(symptom, auto_heal=True, max_auto_tier=1)
+    assert "reclaim_memory_caches" in executed_pbs
+    assert "clean_user_memory_caches" in executed_pbs
+    assert state["execution"]["playbook_id"] == "clean_user_memory_caches"
+    assert state["execution"]["success"] is True
+
+
+def test_diagnostician_avoids_recently_failed_playbook(tmp_path: Path) -> None:
+    from omarchy_healer.models import HealerGraphState
+
+    orchestrator = _orchestrator(tmp_path)
+    symptom = SymptomEvent.create(
+        probe_name="memory_and_process",
+        domain="memory_pressure",
+        fingerprint_key="ram_leak",
+        title="High RAM",
+        summary="Memory high",
+        suggested_playbook="reclaim_memory_caches",
+        default_tier=0,
+    )
+
+    # Record a prior failed incident with reclaim_memory_caches
+    state: HealerGraphState = {
+        "symptom": symptom.model_dump(),
+        "triage": {"provider": "heuristic", "domain": "memory_pressure", "selected_playbook": "reclaim_memory_caches", "safety_tier": 0},
+        "diagnosis": {"provider": "heuristic", "recommended_playbook": "reclaim_memory_caches", "safety_tier": 0},
+        "plan": {"playbook_id": "reclaim_memory_caches", "safety_tier": 0, "approved": True},
+        "execution": {"executed": True, "playbook_id": "reclaim_memory_caches", "success": False},
+        "verification": {"verified": True, "resolved": False},
+        "status": "execution_failed",
+        "agent_trace": [],
+    }
+    orchestrator.memory.record_state(state)
+
+    # Diagnostician should see that reclaim_memory_caches failed recently for this fingerprint
+    failures = orchestrator.memory.find_recent_failures(symptom.fingerprint)
+    assert "reclaim_memory_caches" in failures
+
+
+
 

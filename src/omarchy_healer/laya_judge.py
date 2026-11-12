@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
+import urllib.request
 from typing import Any
 
 from .config import HealerConfig
@@ -11,6 +13,8 @@ from .models import DomainType, SymptomEvent, TriageDecision
 from .playbooks import PLAYBOOK_CATALOG
 
 log = logging.getLogger(__name__)
+
+_LOCAL_LAYA_ROUTER: Any = None
 
 def build_laya_questions() -> dict[str, dict[str, Any]]:
     """Construct parallel TypeSafe System-1 questions (Noul + Choice + Score)."""
@@ -257,6 +261,9 @@ class LayaTriageJudge:
             "systemd_service": 0.75,
             "memory_pressure": 0.70,
             "compositor": 0.80,
+            "disk": 0.85,
+            "network": 0.70,
+            "audio": 0.60,
             "other": 0.30,
         }
         sev = domain_sev.get(symptom.domain, 0.5)

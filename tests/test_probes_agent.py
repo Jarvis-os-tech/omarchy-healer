@@ -439,3 +439,64 @@ def test_collect_all_symptoms_includes_the_crash_probe(
     events = collect_all_symptoms(_config(tmp_path))
 
     assert any(ev.probe_name == "coredump" for ev in events)
+
+
+def test_disk_space_probe_detects_high_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from collections import namedtuple
+    from omarchy_healer.probes import DiskSpaceProbe
+
+    Usage = namedtuple("Usage", ["total", "used", "free"])
+    # 96% full (critical)
+    fake_usage = Usage(total=100 * 1024**3, used=96 * 1024**3, free=4 * 1024**3)
+    monkeypatch.setattr(probes.shutil, "disk_usage", lambda _p: fake_usage)
+
+    probe = DiskSpaceProbe(_config(tmp_path))
+    events = probe.check()
+    assert len(events) >= 1
+    ev = events[0]
+    assert ev.domain == "disk"
+    assert ev.suggested_playbook == "free_disk_space"
+    assert ev.metrics["critical"] is True
+    assert ev.metrics["used_percent"] == 96.0
+
+
+def test_audio_service_probe_detects_failed_pipewire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from omarchy_healer.probes import AudioServiceProbe
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+
+    def fake_run(cmd: list[str], *, timeout: float = 4.0) -> tuple[int, str, str]:
+        if "is-failed" in cmd and "pipewire.service" in cmd:
+            return 0, "failed", ""
+        if "is-active" in cmd and "pipewire.service" in cmd:
+            return 3, "inactive", ""
+        if "is-active" in cmd:
+            return 0, "active", ""
+        return 1, "", ""
+
+    monkeypatch.setattr(probes, "run_cmd", fake_run)
+    probe = AudioServiceProbe(_config(tmp_path))
+    events = probe.check()
+    assert len(events) == 1
+    assert events[0].domain == "audio"
+    assert events[0].suggested_playbook == "restart_pipewire"
+    assert "pipewire.service" in events[0].metrics["failed_units"]
+
+
+def test_network_connectivity_probe_detects_disconnection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from omarchy_healer.probes import NetworkConnectivityProbe
+
+    def fake_run(cmd: list[str], *, timeout: float = 4.0) -> tuple[int, str, str]:
+        if "route" in cmd:
+            return 1, "", "network unreachable"
+        return 0, "", ""
+
+    monkeypatch.setattr(probes, "run_cmd", fake_run)
+    probe = NetworkConnectivityProbe(_config(tmp_path))
+    # First check: consecutive_failures = 1, returns []
+    assert probe.check() == []
+    # Second check: consecutive_failures = 2, returns symptom
+    events = probe.check()
+    assert len(events) == 1
+    assert events[0].domain == "network"
+    assert events[0].suggested_playbook == "reconnect_network"

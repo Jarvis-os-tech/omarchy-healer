@@ -127,6 +127,8 @@ class HealerConfig:
     max_auto_tier: int = 1
     ram_warn_percent: float = 80.0
     ram_crit_percent: float = 90.0
+    disk_warn_percent: float = 85.0
+    disk_crit_percent: float = 95.0
     psi_some_avg10_warn: float = 10.0
     db_path: Path = field(
         default_factory=lambda: Path.home() / ".local" / "share" / "omarchy-healer" / "incidents.db"
@@ -145,6 +147,8 @@ class HealerConfig:
 
         ram_warn = _as_float(env, "HEALER_RAM_WARN_PERCENT", 80.0)
         ram_crit = _as_float(env, "HEALER_RAM_CRIT_PERCENT", 90.0)
+        disk_warn = _as_float(env, "HEALER_DISK_WARN_PERCENT", 85.0)
+        disk_crit = _as_float(env, "HEALER_DISK_CRIT_PERCENT", 95.0)
         db_raw = _first(env, "HEALER_DB_PATH")
         db_path = Path(db_raw).expanduser() if db_raw else (
             Path.home() / ".local" / "share" / "omarchy-healer" / "incidents.db"
@@ -185,6 +189,8 @@ class HealerConfig:
             max_auto_tier=max_auto_tier,
             ram_warn_percent=ram_warn,
             ram_crit_percent=ram_crit,
+            disk_warn_percent=disk_warn,
+            disk_crit_percent=disk_crit,
             db_path=db_path,
             mcp_config_path=mcp_path,
         )
