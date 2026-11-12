@@ -12,7 +12,7 @@ Multi-agent system monitor and self-healing orchestrator for Omarchy / Hyprland 
    - `AudioServiceProbe`: Detects degraded or crashed PipeWire / WirePlumber user audio services in active desktop sessions.
    - `NetworkConnectivityProbe`: Monitors default gateway route and DNS connectivity reachability with consecutive failure gating.
 
-2. **Triage & Safety Judge (`laya_judge.py`)**
+2. **Triage & Safety Judge (`triage_judge.py`)**
    - **Primary**: NVIDIA NIM (`NVIDIA_NIM_API_KEY` via `langchain-openai` against `https://integrate.api.nvidia.com/v1`).
    - **Fallback 1**: Google Gemini (`GEMINI_API_KEY` via `langchain-google-genai`).
    - **Fallback 2**: Calibrated deterministic rule matcher when offline.

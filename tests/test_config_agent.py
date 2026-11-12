@@ -1,4 +1,4 @@
-"""Tests for config hardening: safe numeric parsing, alias scoping, and Laya usability."""
+"""Tests for config hardening: safe numeric parsing and provider usability."""
 from __future__ import annotations
 
 import os
@@ -74,66 +74,29 @@ def test_max_auto_tier_stays_clamped_and_guards_bad_ints(
     assert HealerConfig.from_env().max_auto_tier == 1
 
 
-def test_generic_endpoint_url_and_api_key_are_not_laya_config(
-    isolated_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unrelated project's generic keys must not hijack the triage provider."""
-    monkeypatch.setenv("ENDPOINT_URL", "https://someone-elses-vlm.example/v1")
-    monkeypatch.setenv("API_KEY", "sk-not-ours")
+def test_has_nvidia_nim_and_gemini_flags() -> None:
+    cfg_empty = HealerConfig()
+    assert cfg_empty.has_nvidia_nim() is False
+    assert cfg_empty.has_gemini() is False
+
+    cfg_nvidia = HealerConfig(nvidia_api_key="nv-key")
+    assert cfg_nvidia.has_nvidia_nim() is True
+    assert cfg_nvidia.has_gemini() is False
+
+    cfg_gemini = HealerConfig(gemini_api_key="gm-key")
+    assert cfg_gemini.has_nvidia_nim() is False
+    assert cfg_gemini.has_gemini() is True
+
+
+def test_placeholder_keys_are_filtered_out(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NVIDIA_NIM_API_KEY", "your_nvidia_nim_api_key_here")
+    monkeypatch.setenv("GEMINI_API_KEY", "your_gemini_api_key_here")
 
     cfg = HealerConfig.from_env()
-
-    assert cfg.laya_endpoint_url == ""
-    assert cfg.laya_api_key == ""
-
-
-def test_namespaced_laya_aliases_are_still_honoured(
-    isolated_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SYSTEMONE_ENDPOINT_URL", "https://systemone.example/v1/systemone")
-    monkeypatch.setenv("JEV_API_KEY", "jev-key")
-
-    cfg = HealerConfig.from_env()
-
-    assert cfg.laya_endpoint_url == "https://systemone.example/v1/systemone"
-    assert cfg.laya_api_key == "jev-key"
-
-
-def test_namespaced_keys_win_over_generic_ones(
-    isolated_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("ENDPOINT_URL", "https://wrong-host.example/v1")
-    monkeypatch.setenv("LAYA_ENDPOINT_URL", "https://right-host.example/v1/systemone")
-
-    cfg = HealerConfig.from_env()
-
-    assert cfg.laya_endpoint_url == "https://right-host.example/v1/systemone"
-
-
-def test_has_laya_is_false_when_only_api_key_is_set() -> None:
-    cfg = HealerConfig(laya_api_key="orphan-key")
-
-    assert cfg.laya_endpoint_url == ""
-    assert cfg.has_laya() is False
-
-
-def test_has_laya_true_for_endpoint_or_local_router() -> None:
-    assert HealerConfig(laya_endpoint_url="https://laya.example/v1/systemone").has_laya() is True
-    assert HealerConfig(laya_local=True).has_laya() is True
-    assert HealerConfig(
-        laya_endpoint_url="https://laya.example/v1/systemone", laya_api_key="k"
-    ).has_laya() is True
-
-
-def test_has_laya_false_for_placeholder_endpoint(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LAYA_ENDPOINT_URL", "https://your-laya-endpoint.example/v1/systemone")
-    monkeypatch.setenv("LAYA_API_KEY", "your_laya_api_key_here")
-
-    cfg = HealerConfig.from_env()
-
-    assert cfg.laya_endpoint_url == ""
-    assert cfg.laya_api_key == ""
-    assert cfg.has_laya() is False
+    assert cfg.nvidia_api_key == ""
+    assert cfg.gemini_api_key == ""
+    assert cfg.has_nvidia_nim() is False
+    assert cfg.has_gemini() is False
 
 
 def test_provider_chain_summary_reports_nvidia_nim_configured() -> None:
@@ -148,11 +111,11 @@ def test_provider_chain_summary_order_is_nvidia_then_gemini(isolated_env: None) 
     assert [row["provider"] for row in summary] == ["nvidia_nim", "gemini", "heuristic"]
     assert summary[-1]["configured"] == "yes"
 
+
 def test_model_defaults_are_non_empty_strings(isolated_env: None) -> None:
     for cfg in (HealerConfig(), HealerConfig.from_env()):
         assert isinstance(cfg.gemini_model, str) and cfg.gemini_model.strip()
         assert isinstance(cfg.nvidia_model, str) and cfg.nvidia_model.strip()
-        assert isinstance(cfg.laya_model, str) and cfg.laya_model.strip()
 
 
 def test_model_defaults_are_text_models() -> None:
@@ -176,6 +139,6 @@ def test_placeholder_and_merged_env_public_api_intact() -> None:
     assert _is_placeholder(None) is True
     assert _is_placeholder("  ") is True
     assert _is_placeholder("your_key_here") is True
-    assert _is_placeholder("https://your-laya-endpoint.example/v1") is True
-    assert _is_placeholder("https://laya.example/v1/systemone") is False
+    assert _is_placeholder("https://your-api-endpoint.example/v1") is True
+    assert _is_placeholder("https://integrate.api.nvidia.com/v1") is False
     assert isinstance(load_merged_env(), dict)

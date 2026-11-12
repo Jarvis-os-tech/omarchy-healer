@@ -1,4 +1,4 @@
-"""Configuration loader with Laya -> Gemini -> NVIDIA NIM fallback resolution."""
+"""Configuration loader with NVIDIA NIM -> Gemini -> Heuristic fallback resolution."""
 from __future__ import annotations
 
 import logging
@@ -33,7 +33,6 @@ def _is_placeholder(val: str | None) -> bool:
         lower.startswith("your_")
         or lower.endswith("_here")
         or "your-api-endpoint.example" in lower
-        or "your-laya-endpoint.example" in lower
     )
 
 
@@ -108,22 +107,16 @@ def _as_int(
 
 @dataclass
 class HealerConfig:
-    # 1. Primary: Laya / SystemOne
-    laya_endpoint_url: str = ""
-    laya_api_key: str = ""
-    laya_model: str = "laya-rl-agent"
-    laya_local: bool = False
-    laya_timeout: float = 5.0
+    # 1. Primary: NVIDIA NIM (OpenAI-compatible)
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_model: str = DEFAULT_NVIDIA_MODEL
 
     # 2. Fallback 1: Google Gemini
     gemini_api_key: str = ""
     gemini_model: str = DEFAULT_GEMINI_MODEL
 
-    # 3. Fallback 2: NVIDIA NIM (OpenAI-compatible)
-    nvidia_api_key: str = ""
-    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = DEFAULT_NVIDIA_MODEL
-    # 4. Autonomy & Thresholds
+    # 3. Autonomy & Thresholds
     max_auto_tier: int = 1
     ram_warn_percent: float = 80.0
     ram_crit_percent: float = 90.0
@@ -140,9 +133,6 @@ class HealerConfig:
     @classmethod
     def from_env(cls, extra_env_paths: list[Path] | None = None) -> HealerConfig:
         env = load_merged_env(extra_env_paths)
-        laya_local_raw = _first(env, "LAYA_LOCAL", default="0").lower()
-        laya_local = laya_local_raw in ("1", "true", "yes", "on")
-
         max_auto_tier = _as_int(env, "HEALER_MAX_AUTO_TIER", 1, minimum=0, maximum=2)
 
         ram_warn = _as_float(env, "HEALER_RAM_WARN_PERCENT", 80.0)
@@ -159,33 +149,13 @@ class HealerConfig:
         )
 
         return cls(
-            laya_endpoint_url=_first(
-                env,
-                "LAYA_ENDPOINT_URL",
-                "JEV_ENDPOINT_URL",
-                "SYSTEMONE_ENDPOINT_URL",
-            ),
-            laya_api_key=_first(
-                env,
-                "LAYA_API_KEY",
-                "JEV_API_KEY",
-                "SYSTEMONE_API_KEY",
-            ),
-            laya_model=_first(
-                env,
-                "OMARCHY_LAYA_MODEL",
-                "OMARCHY_JEV_MODEL",
-                "TYPESAFE_MODEL",
-                default="laya-rl-agent",
-            ),
-            laya_local=laya_local,
-            gemini_api_key=_first(env, "GEMINI_API_KEY", "GOOGLE_API_KEY"),
-            gemini_model=_first(env, "HEALER_GEMINI_MODEL", default=DEFAULT_GEMINI_MODEL),
             nvidia_api_key=_first(env, "NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"),
             nvidia_base_url=_first(
                 env, "NVIDIA_BASE_URL", default="https://integrate.api.nvidia.com/v1"
             ),
             nvidia_model=_first(env, "HEALER_NVIDIA_MODEL", default=DEFAULT_NVIDIA_MODEL),
+            gemini_api_key=_first(env, "GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            gemini_model=_first(env, "HEALER_GEMINI_MODEL", default=DEFAULT_GEMINI_MODEL),
             max_auto_tier=max_auto_tier,
             ram_warn_percent=ram_warn,
             ram_crit_percent=ram_crit,
@@ -194,14 +164,6 @@ class HealerConfig:
             db_path=db_path,
             mcp_config_path=mcp_path,
         )
-
-    def has_laya(self) -> bool:
-        """True only when Laya is actually reachable: in-process router or an HTTP endpoint.
-
-        An API key on its own cannot be called, so it must not advertise the
-        primary provider as configured.
-        """
-        return bool(self.laya_local or self.laya_endpoint_url)
 
     def has_gemini(self) -> bool:
         return bool(self.gemini_api_key)

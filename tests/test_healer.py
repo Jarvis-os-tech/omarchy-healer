@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage
 
 from omarchy_healer.config import HealerConfig
 from omarchy_healer.graph import OmarchyHealerOrchestrator
-from omarchy_healer.laya_judge import LayaTriageJudge
+from omarchy_healer.triage_judge import TriageJudge
 from omarchy_healer.llm_router import LLMFallbackRouter
 from omarchy_healer.models import ExecutionResult, SymptomEvent
 from omarchy_healer.playbooks import execute_playbook
@@ -58,7 +58,7 @@ def test_nvidia_nim_primary_triage_success(tmp_path: Path) -> None:
         }
     )
     router = LLMFallbackRouter(cfg, custom_invokers=[("nvidia_nim", nvidia_fake)])
-    judge = LayaTriageJudge(cfg, llm_router=router)
+    judge = TriageJudge(cfg, llm_router=router)
     decision = judge.evaluate(_sample_osd_symptom())
 
     assert decision.provider == "nvidia_nim"
@@ -93,7 +93,7 @@ def test_fallback_to_gemini_when_nvidia_nim_fails(tmp_path: Path) -> None:
             ("gemini", gemini_working),
         ],
     )
-    judge = LayaTriageJudge(cfg, llm_router=router)
+    judge = TriageJudge(cfg, llm_router=router)
     decision = judge.evaluate(_sample_osd_symptom())
 
     assert decision.provider == "gemini"
@@ -119,7 +119,7 @@ def test_fallback_to_heuristic_when_all_llms_fail(tmp_path: Path) -> None:
             ("gemini", gemini_failing),
         ],
     )
-    judge = LayaTriageJudge(cfg, llm_router=router)
+    judge = TriageJudge(cfg, llm_router=router)
     decision = judge.evaluate(_sample_osd_symptom())
 
     assert decision.provider == "heuristic"

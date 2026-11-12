@@ -91,12 +91,12 @@ def _config(tmp_path: Path, **overrides: Any) -> HealerConfig:
 
 
 class _StubJudge:
-    """Deterministic stand-in for Laya so the triage prompt never consumes a scripted LLM."""
+    """Deterministic stand-in so the triage prompt never consumes a scripted LLM."""
 
     def evaluate(self, symptom: SymptomEvent):
-        from omarchy_healer.laya_judge import LayaTriageJudge
+        from omarchy_healer.triage_judge import TriageJudge
 
-        return LayaTriageJudge._heuristic_decision(symptom, ["heuristic"])
+        return TriageJudge._heuristic_decision(symptom, ["heuristic"])
 
 
 def _orchestrator(

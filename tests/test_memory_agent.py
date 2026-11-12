@@ -55,7 +55,7 @@ def _state(index: int = 0, **extra: Any) -> dict[str, Any]:
             "domain": "ui_shell",
             "title": "Stuck Omarchy OSD Overlay Popup",
         },
-        "triage": {"provider": "laya", "selected_playbook": "close_stuck_osd", "safety_tier": 0},
+        "triage": {"provider": "nvidia_nim", "selected_playbook": "close_stuck_osd", "safety_tier": 0},
         "diagnosis": {"provider": "gemini"},
         "plan": {"playbook_id": "close_stuck_osd", "safety_tier": 0},
         "execution": {"executed": True},

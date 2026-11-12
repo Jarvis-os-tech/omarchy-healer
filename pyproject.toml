@@ -1,7 +1,7 @@
 [project]
 name = "omarchy-healer"
 version = "0.1.0"
-description = "Multi-agent system monitor and auto-remediator for Omarchy Linux using LangGraph, LangChain, and Laya with Gemini & NVIDIA NIM fallbacks"
+description = "Multi-agent system monitor and auto-remediator for Omarchy Linux using LangGraph, LangChain, NVIDIA NIM, and Gemini"
 requires-python = ">=3.12"
 dependencies = [
     "langgraph>=0.2.0",
@@ -14,9 +14,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-local-laya = [
-    "laya>=0.4.2",
-]
 dev = [
     "pytest>=8.0.0",
 ]

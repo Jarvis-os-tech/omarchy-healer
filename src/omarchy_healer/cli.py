@@ -716,7 +716,7 @@ def run_watch(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="omarchy-healer",
-        description="LangGraph + Laya (with Gemini & NVIDIA NIM fallbacks) system monitor and auto-healer",
+        description="LangGraph multi-agent system monitor and auto-healer with NVIDIA NIM & Gemini",
     )
     sub = parser.add_subparsers(dest="command")
 

@@ -33,7 +33,7 @@ _REAL_OS_KILL = os.kill
 _ZOMBIE_ACK_TTL_SECONDS = 3600.0
 _ACKNOWLEDGED_ZOMBIE_PIDS: set[int] = set()
 _ACKNOWLEDGED_ZOMBIE_PARENTS: dict[int, float] = {}
-# Playbook registry metadata used by both Laya choice criteria and LangGraph Planner
+# Playbook registry metadata used by both Triage Judge and LangGraph Planner
 PLAYBOOK_CATALOG: dict[str, dict[str, Any]] = {
     "close_stuck_osd": {
         "tier": 0,
@@ -363,21 +363,15 @@ def _run_free_disk_space(args: dict[str, Any], started: float) -> ExecutionResul
     thumb_dir = Path.home() / ".cache" / "thumbnails"
     if thumb_dir.is_dir():
         thumb_freed = 0
-        try:
-            for root, _, files in os.walk(thumb_dir):
-                for f in files:
-                    fp = Path(root) / f
-                    try:
-                        sz = fp.stat().st_size
-                        fp.unlink(missing_ok=True)
-                        thumb_freed += sz
-                    except OSError:
-                        pass
-            if thumb_freed > 0:
-                freed_approx_mb += thumb_freed / (1024 * 1024)
-                notes.append(f"Purged thumbnails cache ({thumb_freed / (1024 * 1024):.1f} MiB)")
-        except OSError:
-            pass
+        for fp in thumb_dir.rglob("*"):
+            if fp.is_file():
+                try:
+                    thumb_freed += fp.stat().st_size
+                    fp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if thumb_freed > 0:
+            notes.append(f"Purged thumbnails cache ({thumb_freed / (1024 * 1024):.1f} MiB)")
 
     success = bool(notes)
     return ExecutionResult(

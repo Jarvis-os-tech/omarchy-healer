@@ -18,7 +18,7 @@ DomainType = Literal[
     "other",
 ]
 
-ProviderType = Literal["laya", "gemini", "nvidia_nim", "heuristic", "memory_cache"]
+ProviderType = Literal["gemini", "nvidia_nim", "heuristic", "memory_cache"]
 EscalationReason = Literal[
     "missing_playbook",
     "insufficient_autonomy_tier",
@@ -82,7 +82,7 @@ class SymptomEvent(BaseModel):
 
 
 class TriageDecision(BaseModel):
-    """Output of the Triage & Safety Judge (Laya primary -> Gemini -> NVIDIA NIM -> Heuristic)."""
+    """Output of the Triage & Safety Judge (NVIDIA NIM primary -> Gemini -> Heuristic)."""
 
     provider: ProviderType
     domain: DomainType

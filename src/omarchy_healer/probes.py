@@ -40,86 +40,47 @@ def run_cmd(cmd: list[str], *, timeout: float = 4.0) -> tuple[int, str, str]:
 
 
 def _normalize_osd_state(raw: str) -> str:
-    """Reduce `omarchy-shell osd state` output to one lowercased comparable token.
-
-    Tolerates case, whitespace, quoting, JSON objects, and ``key=value`` /
-    ``key: value`` wrappers; returns "" when nothing usable is present.
-    """
+    """Reduce `omarchy-shell osd state` output to one lowercased comparable token."""
     text = (raw or "").strip()
     if not text:
         return ""
-
-    parsed: Any = None
     try:
         parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            for key in ("state", "status", "osd_state", "osd", "value"):
+                if key in parsed:
+                    return str(parsed[key]).strip("\"'").rstrip(".").lower()
+        if isinstance(parsed, (str, bool, int)):
+            return str(parsed).strip("\"'").rstrip(".").lower()
     except (ValueError, TypeError):
-        parsed = None
-
-    candidates: list[Any]
-    if isinstance(parsed, dict):
-        candidates = [
-            parsed.get(key) for key in ("state", "status", "osd_state", "osd", "value")
-        ]
-    elif isinstance(parsed, (str, bool, int)):
-        candidates = [parsed]
-    else:
-        candidates = []
-
-    if not candidates:
-        tail = text
-        for sep in ("=", ":"):
-            if sep in tail:
-                tail = tail.rsplit(sep, 1)[-1]
-        candidates = [tail]
-
-    for candidate in candidates:
-        if isinstance(candidate, bool):
-            return "true" if candidate else "false"
-        if isinstance(candidate, (str, int)):
-            token = str(candidate).strip().strip("\"'").strip().rstrip(".").lower()
-            if token:
-                return token
-    return ""
+        pass
+    for sep in ("=", ":"):
+        if sep in text:
+            text = text.rsplit(sep, 1)[-1]
+    return text.strip().strip("\"'").rstrip(".").lower()
 
 
 def _osd_reports_open(rc: int, out: str) -> bool:
     """Report whether the shell command succeeded *and* says the OSD is open."""
-    if rc != 0:
-        return False
-    return _normalize_osd_state(out) in _OSD_OPEN_TOKENS
+    return rc == 0 and _normalize_osd_state(out) in _OSD_OPEN_TOKENS
 
 
 def _scan_layer_namespaces(layers_data: Any) -> set[str]:
-    """Collect every layer namespace from a `hyprctl layers -j` payload.
-
-    Hyprland >= 0.45 returns a JSON object keyed by monitor name; older
-    releases return a bare JSON array. Both shapes are accepted, and any
-    malformed element is skipped rather than raised.
-    """
-    if isinstance(layers_data, dict):
-        monitors: Any = list(layers_data.values())
-    elif isinstance(layers_data, list):
-        monitors = layers_data
-    else:
-        return set()
-
-    namespaces: set[str] = set()
-    for monitor_data in monitors:
-        if not isinstance(monitor_data, dict):
-            continue
-        levels = monitor_data.get("levels")
-        if not isinstance(levels, dict):
-            continue
-        for level_items in levels.values():
-            if not isinstance(level_items, list):
-                continue
-            for item in level_items:
-                if not isinstance(item, dict):
-                    continue
-                namespace = item.get("namespace")
-                if isinstance(namespace, str) and namespace:
-                    namespaces.add(namespace)
-    return namespaces
+    """Collect every layer namespace from a `hyprctl layers -j` payload."""
+    monitors = (
+        list(layers_data.values())
+        if isinstance(layers_data, dict)
+        else (layers_data if isinstance(layers_data, list) else [])
+    )
+    return {
+        item.get("namespace")
+        for m in monitors
+        if isinstance(m, dict) and isinstance(m.get("levels"), dict)
+        for items in m["levels"].values()
+        if isinstance(items, list)
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("namespace"), str) and item.get("namespace")
+    }
 
 
 class OmarchyUiProbe:

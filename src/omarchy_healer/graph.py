@@ -9,7 +9,7 @@ from typing import Any, Callable, cast
 from langgraph.graph import END, START, StateGraph
 
 from .config import HealerConfig
-from .laya_judge import LayaTriageJudge
+from .triage_judge import TriageJudge
 from .llm_router import LLMFallbackRouter
 from .memory import IncidentMemoryStore
 from .formatting import (
@@ -201,13 +201,13 @@ def _collect_tool_evidence(domain: str, mcp_config_path: Any) -> dict[str, str]:
 
 
 class OmarchyHealerOrchestrator:
-    """Multi-agent system monitor & self-healer built on LangGraph + Laya + Gemini/NVIDIA NIM."""
+    """Multi-agent system monitor & self-healer built on LangGraph + NVIDIA NIM + Gemini."""
 
     def __init__(
         self,
         config: HealerConfig | None = None,
         *,
-        triage_judge: LayaTriageJudge | None = None,
+        triage_judge: TriageJudge | None = None,
         llm_router: LLMFallbackRouter | None = None,
         memory_store: IncidentMemoryStore | None = None,
         probe_runner: Callable[[HealerConfig], list[SymptomEvent]] | None = None,
@@ -216,7 +216,7 @@ class OmarchyHealerOrchestrator:
     ) -> None:
         self.config = config or HealerConfig.from_env()
         self.llm_router = llm_router or LLMFallbackRouter(self.config)
-        self.triage_judge = triage_judge or LayaTriageJudge(
+        self.triage_judge = triage_judge or TriageJudge(
             self.config, llm_router=self.llm_router
         )
         self.memory = memory_store or IncidentMemoryStore(self.config.db_path)
