@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# omarchy:summary=Launch default AI coding agent with diagnostic context to improve omarchy-healer
+# omarchy:args=[incident_id]
+
+# Triggered when clicking an "Omarchy Healer: [Add Capability]" or "[Upgrade Capability]"
+# desktop notification, or run directly by hand.
+# Opens the user's default coding agent (Gemini, Claude, Codex, OpenCode, etc.)
+# inside /home/g0pi/Projects/omarchy-healer with the exact anomaly, failure trace,
+# proposed playbook spec, and instructions on how to implement and test it.
+
+set -euo pipefail
+
+readonly REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly HEALER_BIN="$REPO_DIR/.venv/bin/omarchy-healer"
+
+cd "$REPO_DIR"
+
+if [[ -x "$HEALER_BIN" ]]; then
+  exec "$HEALER_BIN" improve "$@"
+else
+  exec uv run --directory "$REPO_DIR" omarchy-healer improve "$@"
+fi

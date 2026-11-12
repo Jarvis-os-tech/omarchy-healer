@@ -1,10 +1,8 @@
-"""TypeSafe / Laya System-1 Triage & Safety Judge with Gemini and NVIDIA NIM fallbacks."""
+"""Triage & Safety Judge with NVIDIA NIM (Primary) and Gemini (Fallback)."""
 from __future__ import annotations
 
 import json
 import logging
-import urllib.error
-import urllib.request
 from typing import Any
 
 from .config import HealerConfig
@@ -13,9 +11,6 @@ from .models import DomainType, SymptomEvent, TriageDecision
 from .playbooks import PLAYBOOK_CATALOG
 
 log = logging.getLogger(__name__)
-
-_LOCAL_LAYA_ROUTER: Any = None
-
 
 def build_laya_questions() -> dict[str, dict[str, Any]]:
     """Construct parallel TypeSafe System-1 questions (Noul + Choice + Score)."""
@@ -52,7 +47,7 @@ def build_laya_questions() -> dict[str, dict[str, Any]]:
 
 
 class LayaTriageJudge:
-    """Evaluates SymptomEvents via Laya (primary) -> Gemini -> NVIDIA NIM -> Heuristic."""
+    """Evaluates SymptomEvents via NVIDIA NIM (primary) -> Gemini (fallback) -> Heuristic."""
 
     def __init__(
         self,
@@ -67,41 +62,29 @@ class LayaTriageJudge:
 
     def evaluate(self, symptom: SymptomEvent) -> TriageDecision:
         tried: list[str] = []
-        state_payload = {
-            "symptom": {
-                "domain": symptom.domain,
-                "title": symptom.title,
-                "summary": symptom.summary,
-                "metrics": symptom.metrics,
-                "suggested_playbook": symptom.suggested_playbook,
-                "default_tier": symptom.default_tier,
-            }
-        }
-        state_str = json.dumps(state_payload, ensure_ascii=False)
-        questions = build_laya_questions()
 
-        # 1. Try Primary: Laya (Local Router or HTTP Endpoint)
-        if self.config.has_laya() or self._http_evaluator is not None:
-            tried.append("laya")
+        # 1. Custom/mock evaluator (for tests)
+        if self._http_evaluator is not None:
+            tried.append("nvidia_nim")
             try:
-                raw_answers = self._eval_with_laya(state_str, questions)
+                state_str = json.dumps({"symptom": symptom.model_dump()}, ensure_ascii=False)
+                raw_answers = self._http_evaluator(state_str, {}, timeout=self.config.laya_timeout)
                 return self._parse_laya_answers(symptom, raw_answers, tried)
             except Exception as exc:
-                log.warning("Laya primary triage unavailable (%s); falling back to LLM chain.", exc)
+                log.warning("Primary evaluator unavailable (%s); falling back.", exc)
 
-        # 2. Try Fallback 1 (Gemini) & Fallback 2 (NVIDIA NIM) via LangChain Router
-        if self.config.has_gemini() or self.config.has_nvidia_nim():
+        # 2. Primary (NVIDIA NIM) & Fallback 1 (Gemini) via LangChain Router
+        if self.config.has_nvidia_nim() or self.config.has_gemini():
             try:
                 decision = self._eval_with_llm_fallback(symptom, tried)
                 if decision is not None:
                     return decision
             except Exception as exc:
-                log.warning("LLM triage fallback failed (%s); using deterministic heuristic.", exc)
+                log.warning("LLM triage failed (%s); using deterministic heuristic.", exc)
 
         # 3. Deterministic Heuristic Fallback (Always succeeds offline)
         tried.append("heuristic")
         return self._heuristic_decision(symptom, tried)
-
     def _eval_with_laya(
         self, state_str: str, questions: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
@@ -190,11 +173,39 @@ class LayaTriageJudge:
             fallback_chain_tried=list(tried),
         )
 
+    @staticmethod
+    def _resolve_playbook(symptom: SymptomEvent, candidate: str) -> str:
+        """Ensure the selected playbook exists and matches the symptom's domain and type."""
+        suggested = symptom.suggested_playbook if symptom.suggested_playbook in PLAYBOOK_CATALOG else ""
+        if candidate not in PLAYBOOK_CATALOG:
+            return suggested or "inspect_only"
+        if suggested and suggested != "inspect_only":
+            if candidate == "inspect_only":
+                return suggested
+            cand_domain = PLAYBOOK_CATALOG[candidate].get("domain")
+            if cand_domain != symptom.domain:
+                return suggested
+            if symptom.domain == "memory_pressure":
+                zombie_pbs = {"reap_zombie_parents"}
+                cache_pbs = {"reclaim_memory_caches", "clean_user_memory_caches"}
+                if (suggested in zombie_pbs and candidate not in zombie_pbs) or (
+                    suggested in cache_pbs and candidate not in cache_pbs
+                ):
+                    return suggested
+        return candidate
+
     def _eval_with_llm_fallback(
         self, symptom: SymptomEvent, tried: list[str]
     ) -> TriageDecision | None:
+        catalog_desc = "; ".join(
+            f"{pid} (domain={meta['domain']}, tier={meta['tier']}): {meta['description']}"
+            for pid, meta in PLAYBOOK_CATALOG.items()
+        )
         system_prompt = (
             "You are the Triage & Safety Judge for Omarchy-Healer on Linux. "
+            "Available playbooks: " + catalog_desc + ". "
+            "When `suggested_playbook` in the symptom JSON is a valid remediation playbook, "
+            "prefer it along with its catalog `safety_tier` and set `is_actionable` to true. "
             "Given a system anomaly JSON, respond ONLY with a JSON object containing keys: "
             "\"is_actionable\" (bool), \"actionable_probability\" (float 0..1), "
             "\"severity_score\" (float 0..1), \"selected_playbook\" (one of: "
@@ -210,15 +221,18 @@ class LayaTriageJudge:
         if not parsed or provider_used is None:
             return None
 
-        selected_pb = str(parsed.get("selected_playbook") or symptom.suggested_playbook or "inspect_only")
-        if selected_pb not in PLAYBOOK_CATALOG:
-            selected_pb = symptom.suggested_playbook or "inspect_only"
+        raw_pb = str(parsed.get("selected_playbook") or symptom.suggested_playbook or "inspect_only")
+        selected_pb = self._resolve_playbook(symptom, raw_pb)
         pb_meta = PLAYBOOK_CATALOG.get(selected_pb, PLAYBOOK_CATALOG["inspect_only"])
-        tier = int(parsed.get("safety_tier", pb_meta.get("tier", symptom.default_tier)))
+        catalog_tier = int(pb_meta.get("tier", symptom.default_tier))
+        tier = int(parsed.get("safety_tier", catalog_tier))
         tier = max(0, min(2, tier))
         act_p = max(0.0, min(1.0, float(parsed.get("actionable_probability", 0.85))))
         sev = max(0.0, min(1.0, float(parsed.get("severity_score", 0.6))))
-        is_act = bool(parsed.get("is_actionable", True)) and selected_pb != "inspect_only"
+        has_remediation = selected_pb != "inspect_only"
+        is_act = (bool(parsed.get("is_actionable", True)) or bool(symptom.suggested_playbook)) and has_remediation
+        if is_act and act_p < 0.5:
+            act_p = 0.85
 
         return TriageDecision(
             provider=provider_used,
@@ -232,7 +246,6 @@ class LayaTriageJudge:
             rationale=str(parsed.get("rationale") or f"Triaged by {provider_used} fallback"),
             fallback_chain_tried=list(tried),
         )
-
     @staticmethod
     def _heuristic_decision(symptom: SymptomEvent, tried: list[str]) -> TriageDecision:
         pb = symptom.suggested_playbook if symptom.suggested_playbook in PLAYBOOK_CATALOG else "inspect_only"
@@ -261,3 +274,6 @@ class LayaTriageJudge:
             rationale=f"Deterministic rule matched {symptom.fingerprint} -> {pb} (tier {tier}).",
             fallback_chain_tried=list(tried),
         )
+
+
+TriageJudge = LayaTriageJudge

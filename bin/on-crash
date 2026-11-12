@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# omarchy:summary=Hand a fresh coredump to omarchy-healer for automated remediation
+
+# Called by omarchy-crash-watch the moment a core dump lands.
+#
+# The healer's own `watch` loop already tails the same journald MESSAGE_ID, but
+# only on its 30-second sweep. This just wakes the remediation path up right
+# away instead of up to 30 seconds late. omarchy-healer claims each dump in
+# coredump.state, so whichever path reaches a crash first owns it and the other
+# one no-ops: no double restart, no duplicate incident.
+#
+# Takes no arguments on purpose -- the healer reads the crash facts back out of
+# the journal itself, where they carry the structured COREDUMP_* fields rather
+# than a 15-character truncated comm.
+
+set -uo pipefail
+
+# Absolute path: user services do not reliably inherit the interactive PATH
+# where the ~/.local/bin symlink lives. Matches omarchy-healer.service.
+readonly REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly HEALER="${REPO_DIR}/.venv/bin/omarchy-healer"
+
+# -n: if a heal is already in flight, drop this one and let the 30s sweep pick
+# the crash up, rather than stacking a second full LLM triage on the first.
+# lock is on tmpfs, so it vanishes with the session and needs no cleanup.
+exec /usr/bin/flock --nonblock \
+  "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-healer-heal.lock" \
+  "$HEALER" heal --max-tier 1

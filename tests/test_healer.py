@@ -42,111 +42,92 @@ def _sample_osd_symptom() -> SymptomEvent:
     )
 
 
-def test_laya_primary_triage_success(tmp_path: Path) -> None:
+def test_nvidia_nim_primary_triage_success(tmp_path: Path) -> None:
     cfg = HealerConfig(
-        laya_endpoint_url="https://laya.example/v1/systemone",
-        laya_api_key="test-laya-key",
-        db_path=tmp_path / "incidents.db",
-    )
-
-    def fake_laya_http(state: str, questions: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
-        assert "stuck_omarchy_osd" in state or "Stuck Omarchy OSD" in state
-        assert set(questions.keys()) == {"actionable", "playbook", "severity"}
-        return {
-            "answers": {
-                "actionable": {"type": "noul", "noul": 0.97},
-                "playbook": {
-                    "type": "choice",
-                    "choice": "close_stuck_osd",
-                    "probabilities": {"close_stuck_osd": 0.94, "inspect_only": 0.06},
-                },
-                "severity": {"type": "score", "score": 1.2},
-            }
-        }
-
-    judge = LayaTriageJudge(cfg, http_evaluator=fake_laya_http)
-    decision = judge.evaluate(_sample_osd_symptom())
-
-    assert decision.provider == "laya"
-    assert decision.is_actionable is True
-    assert decision.selected_playbook == "close_stuck_osd"
-    assert decision.safety_tier == 0
-    assert decision.fallback_chain_tried == ["laya"]
-
-
-def test_fallback_to_gemini_when_laya_fails(tmp_path: Path) -> None:
-    cfg = HealerConfig(
-        laya_endpoint_url="https://laya.example/v1/systemone",
-        laya_api_key="test-laya-key",
-        gemini_api_key="test-gemini-key",
-        db_path=tmp_path / "incidents.db",
-    )
-
-    def failing_laya_http(_state: str, _questions: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
-        raise RuntimeError("Laya endpoint 503 unavailable")
-
-    gemini_fake = _FakeLLM(
-        {
-            "is_actionable": True,
-            "actionable_probability": 0.93,
-            "severity_score": 0.4,
-            "selected_playbook": "close_stuck_osd",
-            "safety_tier": 0,
-            "rationale": "Gemini fallback selected close_stuck_osd",
-        }
-    )
-    router = LLMFallbackRouter(cfg, custom_invokers=[("gemini", gemini_fake)])
-    judge = LayaTriageJudge(cfg, llm_router=router, http_evaluator=failing_laya_http)
-
-    decision = judge.evaluate(_sample_osd_symptom())
-    assert decision.provider == "gemini"
-    assert decision.selected_playbook == "close_stuck_osd"
-    assert decision.fallback_chain_tried == ["laya", "gemini"]
-    assert gemini_fake.calls == 1
-
-
-def test_fallback_to_nvidia_nim_when_laya_and_gemini_fail(tmp_path: Path) -> None:
-    cfg = HealerConfig(
-        laya_endpoint_url="https://laya.example/v1/systemone",
-        laya_api_key="test-laya-key",
-        gemini_api_key="test-gemini-key",
         nvidia_api_key="test-nvidia-key",
         db_path=tmp_path / "incidents.db",
     )
-
-    def failing_laya_http(_state: str, _questions: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
-        raise RuntimeError("Laya connection refused")
-
-    gemini_failing = _FakeLLM(error=RuntimeError("Gemini 429 quota exceeded"))
-    nvidia_working = _FakeLLM(
+    nvidia_fake = _FakeLLM(
         {
             "is_actionable": True,
-            "actionable_probability": 0.91,
-            "severity_score": 0.55,
+            "actionable_probability": 0.95,
+            "severity_score": 0.45,
             "selected_playbook": "close_stuck_osd",
             "safety_tier": 0,
-            "rationale": "NVIDIA NIM fallback triaged stuck OSD",
+            "rationale": "NVIDIA NIM primary triaged stuck OSD",
         }
     )
+    router = LLMFallbackRouter(cfg, custom_invokers=[("nvidia_nim", nvidia_fake)])
+    judge = LayaTriageJudge(cfg, llm_router=router)
+    decision = judge.evaluate(_sample_osd_symptom())
+
+    assert decision.provider == "nvidia_nim"
+    assert decision.is_actionable is True
+    assert decision.selected_playbook == "close_stuck_osd"
+    assert decision.safety_tier == 0
+    assert decision.fallback_chain_tried == ["nvidia_nim"]
+    assert nvidia_fake.calls == 1
+
+
+def test_fallback_to_gemini_when_nvidia_nim_fails(tmp_path: Path) -> None:
+    cfg = HealerConfig(
+        nvidia_api_key="test-nvidia-key",
+        gemini_api_key="test-gemini-key",
+        db_path=tmp_path / "incidents.db",
+    )
+    nvidia_failing = _FakeLLM(error=RuntimeError("NVIDIA NIM 500 error"))
+    gemini_working = _FakeLLM(
+        {
+            "is_actionable": True,
+            "actionable_probability": 0.92,
+            "severity_score": 0.5,
+            "selected_playbook": "close_stuck_osd",
+            "safety_tier": 0,
+            "rationale": "Gemini fallback triaged stuck OSD",
+        }
+    )
+    router = LLMFallbackRouter(
+        cfg,
+        custom_invokers=[
+            ("nvidia_nim", nvidia_failing),
+            ("gemini", gemini_working),
+        ],
+    )
+    judge = LayaTriageJudge(cfg, llm_router=router)
+    decision = judge.evaluate(_sample_osd_symptom())
+
+    assert decision.provider == "gemini"
+    assert decision.selected_playbook == "close_stuck_osd"
+    assert decision.fallback_chain_tried == ["nvidia_nim", "gemini"]
+    assert nvidia_failing.calls == 1
+    assert gemini_working.calls == 1
+
+
+def test_fallback_to_heuristic_when_all_llms_fail(tmp_path: Path) -> None:
+    cfg = HealerConfig(
+        nvidia_api_key="test-nvidia-key",
+        gemini_api_key="test-gemini-key",
+        db_path=tmp_path / "incidents.db",
+    )
+    nvidia_failing = _FakeLLM(error=RuntimeError("NVIDIA NIM error"))
+    gemini_failing = _FakeLLM(error=RuntimeError("Gemini error"))
 
     router = LLMFallbackRouter(
         cfg,
         custom_invokers=[
+            ("nvidia_nim", nvidia_failing),
             ("gemini", gemini_failing),
-            ("nvidia_nim", nvidia_working),
         ],
     )
-    judge = LayaTriageJudge(cfg, llm_router=router, http_evaluator=failing_laya_http)
-
+    judge = LayaTriageJudge(cfg, llm_router=router)
     decision = judge.evaluate(_sample_osd_symptom())
-    assert decision.provider == "nvidia_nim"
+
+    assert decision.provider == "heuristic"
     assert decision.selected_playbook == "close_stuck_osd"
-    assert decision.fallback_chain_tried == ["laya", "gemini", "nvidia_nim"]
-    assert gemini_failing.calls == 1
-    assert nvidia_working.calls == 1
+    assert decision.fallback_chain_tried == ["nvidia_nim", "gemini", "heuristic"]
 
-
-def test_mcp_probe_and_repair_playbook_with_backup(tmp_path: Path) -> None:
+def test_mcp_probe_defers_to_user_when_binary_is_unrepairable(tmp_path: Path) -> None:
+    """A missing MCP binary is a deployment problem, so Tier 1 must not 'fix' it by deletion."""
     mcp_file = tmp_path / "mcp.json"
     mcp_file.write_text(
         json.dumps(
@@ -172,17 +153,35 @@ def test_mcp_probe_and_repair_playbook_with_backup(tmp_path: Path) -> None:
     assert ev.domain == "mcp_config"
     assert ev.suggested_playbook == "repair_or_disable_mcp_server"
 
-    res = execute_playbook("repair_or_disable_mcp_server", ev.suggested_args)
+    res = execute_playbook(ev.suggested_playbook, ev.suggested_args)
+    assert res.success is False
+    assert res.backup_path is None
+
+    # Nothing was removed: the entry is still configured and still reported, so the
+    # escalation path can ask the user to install it or run with --max-tier 2.
+    updated = json.loads(mcp_file.read_text(encoding="utf-8"))
+    assert "codebase-memory-mcp" in updated["mcpServers"]
+    assert "_disabled_mcpServers" not in updated
+    assert len(probe._check_mcp_config()) == 1
+
+
+def test_mcp_quarantine_moves_entry_only_when_approved(tmp_path: Path) -> None:
+    """Tier 2 quarantine still works once a human opts in with --max-tier 2."""
+    mcp_file = tmp_path / "mcp.json"
+    mcp_file.write_text(
+        json.dumps({"mcpServers": {"gone": {"command": "/nonexistent/gone"}}}),
+        encoding="utf-8",
+    )
+
+    res = execute_playbook(
+        "quarantine_mcp_server", {"config_path": str(mcp_file), "server_name": "gone"}
+    )
+
     assert res.success is True
     assert res.backup_path is not None and Path(res.backup_path).is_file()
-
-    # Re-probing after repair must find 0 broken MCP servers
-    post_events = probe._check_mcp_config()
-    assert len(post_events) == 0
-
     updated = json.loads(mcp_file.read_text(encoding="utf-8"))
-    assert "codebase-memory-mcp" not in updated["mcpServers"]
-    assert "codebase-memory-mcp" in updated["_disabled_mcpServers"]
+    assert "gone" not in updated["mcpServers"]
+    assert "gone" in updated["_disabled_mcpServers"]
 
 
 def test_langgraph_end_to_end_auto_heal_and_verify(tmp_path: Path) -> None:

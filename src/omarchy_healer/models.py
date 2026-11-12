@@ -16,6 +16,17 @@ DomainType = Literal[
 ]
 
 ProviderType = Literal["laya", "gemini", "nvidia_nim", "heuristic", "memory_cache"]
+EscalationReason = Literal[
+    "missing_playbook",
+    "insufficient_autonomy_tier",
+    "remediation_failed",
+]
+
+
+MIN_SAFETY_TIER = 0
+MAX_SAFETY_TIER = 2
+
+VERIFICATION_SWEEP_KEY = "verification_sweep"
 
 
 class SymptomEvent(BaseModel):
@@ -75,7 +86,7 @@ class TriageDecision(BaseModel):
     severity_score: float = Field(ge=0.0, le=1.0)
     is_actionable: bool
     actionable_probability: float = Field(ge=0.0, le=1.0)
-    safety_tier: int = Field(ge=0, le=2)
+    safety_tier: int = Field(ge=MIN_SAFETY_TIER, le=MAX_SAFETY_TIER)
     selected_playbook: str
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     rationale: str = ""
@@ -90,8 +101,9 @@ class DiagnosisReport(BaseModel):
     evidence_summary: str
     recommended_playbook: str
     playbook_args: dict[str, Any] = Field(default_factory=dict)
-    safety_tier: int = Field(default=0, ge=0, le=2)
+    safety_tier: int = Field(default=MIN_SAFETY_TIER, ge=MIN_SAFETY_TIER, le=MAX_SAFETY_TIER)
     risk_notes: str = ""
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class RemediationPlan(BaseModel):
@@ -99,7 +111,7 @@ class RemediationPlan(BaseModel):
 
     playbook_id: str
     playbook_args: dict[str, Any] = Field(default_factory=dict)
-    safety_tier: int = Field(default=0, ge=0, le=2)
+    safety_tier: int = Field(default=MIN_SAFETY_TIER, ge=MIN_SAFETY_TIER, le=MAX_SAFETY_TIER)
     approved: bool = False
     approval_reason: str = ""
     description: str = ""
@@ -126,6 +138,18 @@ class VerificationReport(BaseModel):
     remaining_anomalies: int = 0
 
 
+
+class CapabilityEscalation(BaseModel):
+    """Output of the Capability Escalator Agent when an issue cannot be resolved."""
+
+    reason: EscalationReason
+    provider: ProviderType
+    missing_capability: str
+    proposed_playbook_id: str
+    proposed_feature_spec: str
+    agent_prompt: str
+    notified: bool = False
+
 class HealerGraphState(TypedDict, total=False):
     """State passed through the LangGraph multi-agent workflow."""
 
@@ -140,3 +164,5 @@ class HealerGraphState(TypedDict, total=False):
     verification: dict[str, Any]
     status: str
     agent_trace: list[str]
+    verification_sweep: dict[str, Any]
+    escalation: dict[str, Any]

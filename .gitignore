@@ -24,6 +24,8 @@ htmlcov/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.db-shm
+*.db-wal
 incidents.db
 
 # Build artifacts

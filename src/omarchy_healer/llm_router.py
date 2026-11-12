@@ -37,8 +37,7 @@ def extract_json_object(raw_text: str) -> dict[str, Any] | None:
 
 
 class LLMFallbackRouter:
-    """Routes LangChain prompts across Gemini (Fallback 1) -> NVIDIA NIM (Fallback 2)."""
-
+    """Routes LangChain prompts across NVIDIA NIM (Primary) -> Gemini (Fallback)."""
     def __init__(
         self,
         config: HealerConfig,
@@ -53,21 +52,6 @@ class LLMFallbackRouter:
             return list(self._custom_invokers)
 
         models: list[tuple[ProviderType, Any]] = []
-        if self.config.has_gemini():
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-
-                gemini_llm = ChatGoogleGenerativeAI(
-                    model=self.config.gemini_model,
-                    google_api_key=self.config.gemini_api_key,
-                    temperature=0.1,
-                    timeout=10,
-                    max_retries=0,
-                )
-                models.append(("gemini", gemini_llm))
-            except Exception as exc:
-                log.warning("Failed to initialize ChatGoogleGenerativeAI: %s", exc)
-
         if self.config.has_nvidia_nim():
             try:
                 from langchain_openai import ChatOpenAI
@@ -77,12 +61,28 @@ class LLMFallbackRouter:
                     api_key=self.config.nvidia_api_key,
                     base_url=self.config.nvidia_base_url,
                     temperature=0.1,
-                    timeout=8,
+                    timeout=10,
                     max_retries=0,
                 )
                 models.append(("nvidia_nim", nvidia_llm))
             except Exception as exc:
                 log.warning("Failed to initialize NVIDIA NIM ChatOpenAI: %s", exc)
+
+        if self.config.has_gemini():
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+
+                gemini_llm = ChatGoogleGenerativeAI(
+                    model=self.config.gemini_model,
+                    google_api_key=self.config.gemini_api_key,
+                    temperature=0.1,
+                    timeout=15,
+                    max_retries=0,
+                    thinking_budget=0,
+                )
+                models.append(("gemini", gemini_llm))
+            except Exception as exc:
+                log.warning("Failed to initialize ChatGoogleGenerativeAI: %s", exc)
 
         return models
 

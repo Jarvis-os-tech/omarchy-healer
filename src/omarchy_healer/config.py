@@ -1,10 +1,17 @@
 """Configuration loader with Laya -> Gemini -> NVIDIA NIM fallback resolution."""
 from __future__ import annotations
 
+import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import dotenv_values
+
+log = logging.getLogger(__name__)
+
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 DEFAULT_SEARCH_ENV_PATHS: tuple[Path, ...] = (
     Path.cwd() / ".env",
@@ -61,6 +68,44 @@ def _first(env: dict[str, str], *keys: str, default: str = "") -> str:
     return default
 
 
+def _as_float(env: dict[str, str], key: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` on any malformed value.
+
+    A typo in one threshold must not take down the whole CLI at startup.
+    """
+    raw = _first(env, key, default=str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value):
+        log.warning("Ignoring malformed %s=%r; falling back to %s.", key, raw, default)
+        return default
+    return value
+
+
+def _as_int(
+    env: dict[str, str],
+    key: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Parse a clamped int env var, falling back to `default` on any malformed value."""
+    raw = _first(env, key, default=str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning("Ignoring malformed %s=%r; falling back to %s.", key, raw, default)
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
 @dataclass
 class HealerConfig:
     # 1. Primary: Laya / SystemOne
@@ -72,12 +117,12 @@ class HealerConfig:
 
     # 2. Fallback 1: Google Gemini
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = DEFAULT_GEMINI_MODEL
 
     # 3. Fallback 2: NVIDIA NIM (OpenAI-compatible)
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "meta/llama-3.2-11b-vision-instruct"
+    nvidia_model: str = DEFAULT_NVIDIA_MODEL
     # 4. Autonomy & Thresholds
     max_auto_tier: int = 1
     ram_warn_percent: float = 80.0
@@ -96,14 +141,10 @@ class HealerConfig:
         laya_local_raw = _first(env, "LAYA_LOCAL", default="0").lower()
         laya_local = laya_local_raw in ("1", "true", "yes", "on")
 
-        max_tier_raw = _first(env, "HEALER_MAX_AUTO_TIER", default="1")
-        try:
-            max_auto_tier = max(0, min(2, int(max_tier_raw)))
-        except ValueError:
-            max_auto_tier = 1
+        max_auto_tier = _as_int(env, "HEALER_MAX_AUTO_TIER", 1, minimum=0, maximum=2)
 
-        ram_warn = float(_first(env, "HEALER_RAM_WARN_PERCENT", default="80.0"))
-        ram_crit = float(_first(env, "HEALER_RAM_CRIT_PERCENT", default="90.0"))
+        ram_warn = _as_float(env, "HEALER_RAM_WARN_PERCENT", 80.0)
+        ram_crit = _as_float(env, "HEALER_RAM_CRIT_PERCENT", 90.0)
         db_raw = _first(env, "HEALER_DB_PATH")
         db_path = Path(db_raw).expanduser() if db_raw else (
             Path.home() / ".local" / "share" / "omarchy-healer" / "incidents.db"
@@ -117,14 +158,12 @@ class HealerConfig:
             laya_endpoint_url=_first(
                 env,
                 "LAYA_ENDPOINT_URL",
-                "ENDPOINT_URL",
                 "JEV_ENDPOINT_URL",
                 "SYSTEMONE_ENDPOINT_URL",
             ),
             laya_api_key=_first(
                 env,
                 "LAYA_API_KEY",
-                "API_KEY",
                 "JEV_API_KEY",
                 "SYSTEMONE_API_KEY",
             ),
@@ -137,14 +176,12 @@ class HealerConfig:
             ),
             laya_local=laya_local,
             gemini_api_key=_first(env, "GEMINI_API_KEY", "GOOGLE_API_KEY"),
-            gemini_model=_first(env, "HEALER_GEMINI_MODEL", default="gemini-3.8-flash"),
+            gemini_model=_first(env, "HEALER_GEMINI_MODEL", default=DEFAULT_GEMINI_MODEL),
             nvidia_api_key=_first(env, "NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"),
             nvidia_base_url=_first(
                 env, "NVIDIA_BASE_URL", default="https://integrate.api.nvidia.com/v1"
             ),
-            nvidia_model=_first(
-                env, "HEALER_NVIDIA_MODEL", default="meta/llama-3.2-11b-vision-instruct"
-            ),
+            nvidia_model=_first(env, "HEALER_NVIDIA_MODEL", default=DEFAULT_NVIDIA_MODEL),
             max_auto_tier=max_auto_tier,
             ram_warn_percent=ram_warn,
             ram_crit_percent=ram_crit,
@@ -153,7 +190,12 @@ class HealerConfig:
         )
 
     def has_laya(self) -> bool:
-        return bool(self.laya_local or self.laya_endpoint_url or self.laya_api_key)
+        """True only when Laya is actually reachable: in-process router or an HTTP endpoint.
+
+        An API key on its own cannot be called, so it must not advertise the
+        primary provider as configured.
+        """
+        return bool(self.laya_local or self.laya_endpoint_url)
 
     def has_gemini(self) -> bool:
         return bool(self.gemini_api_key)
@@ -164,29 +206,19 @@ class HealerConfig:
     def provider_chain_summary(self) -> list[dict[str, str]]:
         return [
             {
-                "role": "Primary Triage & Safety (System-1)",
-                "provider": "laya",
-                "configured": "yes" if self.has_laya() else "no",
-                "detail": (
-                    "local in-process laya.Router"
-                    if self.laya_local
-                    else (self.laya_endpoint_url or "no endpoint configured")
-                ),
-            },
-            {
-                "role": "Fallback 1 (Triage + LangGraph Agent)",
-                "provider": "gemini",
-                "configured": "yes" if self.has_gemini() else "no",
-                "detail": self.gemini_model,
-            },
-            {
-                "role": "Fallback 2 (Triage + LangGraph Agent)",
+                "role": "Primary Triage & Agent (NVIDIA NIM)",
                 "provider": "nvidia_nim",
                 "configured": "yes" if self.has_nvidia_nim() else "no",
                 "detail": f"{self.nvidia_model} ({self.nvidia_base_url})",
             },
             {
-                "role": "Fallback 3 (Offline Deterministic)",
+                "role": "Fallback 1 (Google Gemini)",
+                "provider": "gemini",
+                "configured": "yes" if self.has_gemini() else "no",
+                "detail": self.gemini_model,
+            },
+            {
+                "role": "Fallback 2 (Offline Deterministic)",
                 "provider": "heuristic",
                 "configured": "yes",
                 "detail": "Built-in calibrated rule & playbook matcher",

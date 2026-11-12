@@ -1,0 +1,181 @@
+"""Tests for config hardening: safe numeric parsing, alias scoping, and Laya usability."""
+from __future__ import annotations
+
+import os
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from omarchy_healer import config as config_module
+from omarchy_healer.config import (
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_NVIDIA_MODEL,
+    HealerConfig,
+    _is_placeholder,
+    load_merged_env,
+)
+
+
+@pytest.fixture
+def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """Detach from the developer's real .env files and shell environment."""
+    monkeypatch.setattr(config_module, "DEFAULT_SEARCH_ENV_PATHS", (tmp_path / "absent.env",))
+    for key in list(os.environ):
+        monkeypatch.delenv(key, raising=False)
+    yield
+
+
+@pytest.mark.parametrize("bad_value", ["eighty", "", "   ", "80,0", "nan", "inf", "80%"])
+def test_malformed_float_env_var_falls_back_to_default(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, bad_value: str
+) -> None:
+    monkeypatch.setenv("HEALER_RAM_WARN_PERCENT", bad_value)
+    monkeypatch.setenv("HEALER_RAM_CRIT_PERCENT", bad_value)
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.ram_warn_percent == 80.0
+    assert cfg.ram_crit_percent == 90.0
+
+
+def test_malformed_float_env_var_does_not_raise(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a single malformed threshold used to raise ValueError at startup."""
+    monkeypatch.setenv("HEALER_RAM_WARN_PERCENT", "eighty")
+
+    cfg = HealerConfig.from_env()
+
+    assert isinstance(cfg.ram_warn_percent, float)
+    assert cfg.ram_warn_percent == 80.0
+
+
+def test_valid_numeric_env_vars_still_parse(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEALER_RAM_WARN_PERCENT", "65.5")
+    monkeypatch.setenv("HEALER_RAM_CRIT_PERCENT", "97")
+    monkeypatch.setenv("HEALER_MAX_AUTO_TIER", "2")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.ram_warn_percent == 65.5
+    assert cfg.ram_crit_percent == 97.0
+    assert cfg.max_auto_tier == 2
+
+
+def test_max_auto_tier_stays_clamped_and_guards_bad_ints(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HEALER_MAX_AUTO_TIER", "9")
+    assert HealerConfig.from_env().max_auto_tier == 2
+
+    monkeypatch.setenv("HEALER_MAX_AUTO_TIER", "-4")
+    assert HealerConfig.from_env().max_auto_tier == 0
+
+    monkeypatch.setenv("HEALER_MAX_AUTO_TIER", "two")
+    assert HealerConfig.from_env().max_auto_tier == 1
+
+
+def test_generic_endpoint_url_and_api_key_are_not_laya_config(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated project's generic keys must not hijack the triage provider."""
+    monkeypatch.setenv("ENDPOINT_URL", "https://someone-elses-vlm.example/v1")
+    monkeypatch.setenv("API_KEY", "sk-not-ours")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.laya_endpoint_url == ""
+    assert cfg.laya_api_key == ""
+
+
+def test_namespaced_laya_aliases_are_still_honoured(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYSTEMONE_ENDPOINT_URL", "https://systemone.example/v1/systemone")
+    monkeypatch.setenv("JEV_API_KEY", "jev-key")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.laya_endpoint_url == "https://systemone.example/v1/systemone"
+    assert cfg.laya_api_key == "jev-key"
+
+
+def test_namespaced_keys_win_over_generic_ones(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ENDPOINT_URL", "https://wrong-host.example/v1")
+    monkeypatch.setenv("LAYA_ENDPOINT_URL", "https://right-host.example/v1/systemone")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.laya_endpoint_url == "https://right-host.example/v1/systemone"
+
+
+def test_has_laya_is_false_when_only_api_key_is_set() -> None:
+    cfg = HealerConfig(laya_api_key="orphan-key")
+
+    assert cfg.laya_endpoint_url == ""
+    assert cfg.has_laya() is False
+
+
+def test_has_laya_true_for_endpoint_or_local_router() -> None:
+    assert HealerConfig(laya_endpoint_url="https://laya.example/v1/systemone").has_laya() is True
+    assert HealerConfig(laya_local=True).has_laya() is True
+    assert HealerConfig(
+        laya_endpoint_url="https://laya.example/v1/systemone", laya_api_key="k"
+    ).has_laya() is True
+
+
+def test_has_laya_false_for_placeholder_endpoint(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LAYA_ENDPOINT_URL", "https://your-laya-endpoint.example/v1/systemone")
+    monkeypatch.setenv("LAYA_API_KEY", "your_laya_api_key_here")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.laya_endpoint_url == ""
+    assert cfg.laya_api_key == ""
+    assert cfg.has_laya() is False
+
+
+def test_provider_chain_summary_reports_nvidia_nim_configured() -> None:
+    cfg = HealerConfig(nvidia_api_key="nv-key")
+    nv_row = cfg.provider_chain_summary()[0]
+    assert nv_row["provider"] == "nvidia_nim"
+    assert nv_row["configured"] == "yes"
+
+
+def test_provider_chain_summary_order_is_nvidia_then_gemini(isolated_env: None) -> None:
+    summary = HealerConfig.from_env().provider_chain_summary()
+    assert [row["provider"] for row in summary] == ["nvidia_nim", "gemini", "heuristic"]
+    assert summary[-1]["configured"] == "yes"
+
+def test_model_defaults_are_non_empty_strings(isolated_env: None) -> None:
+    for cfg in (HealerConfig(), HealerConfig.from_env()):
+        assert isinstance(cfg.gemini_model, str) and cfg.gemini_model.strip()
+        assert isinstance(cfg.nvidia_model, str) and cfg.nvidia_model.strip()
+        assert isinstance(cfg.laya_model, str) and cfg.laya_model.strip()
+
+
+def test_model_defaults_are_text_models() -> None:
+    assert DEFAULT_GEMINI_MODEL == "gemini-3.5-flash"
+    assert DEFAULT_NVIDIA_MODEL == "nvidia/nemotron-3-super-120b-a12b"
+    assert "vision" not in DEFAULT_NVIDIA_MODEL
+    assert "8-flash" not in DEFAULT_GEMINI_MODEL
+
+
+def test_model_env_overrides_still_win(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEALER_GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("HEALER_NVIDIA_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct")
+
+    cfg = HealerConfig.from_env()
+
+    assert cfg.gemini_model == "gemini-2.5-flash"
+    assert cfg.nvidia_model == "nvidia/llama-3.1-nemotron-70b-instruct"
+
+
+def test_placeholder_and_merged_env_public_api_intact() -> None:
+    assert _is_placeholder(None) is True
+    assert _is_placeholder("  ") is True
+    assert _is_placeholder("your_key_here") is True
+    assert _is_placeholder("https://your-laya-endpoint.example/v1") is True
+    assert _is_placeholder("https://laya.example/v1/systemone") is False
+    assert isinstance(load_merged_env(), dict)

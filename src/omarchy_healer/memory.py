@@ -3,11 +3,42 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .models import HealerGraphState
+
+MAX_TRACE_JSON_CHARS = 64 * 1024
+
+
+def _encode_trace(state: HealerGraphState) -> str:
+    """Serialize the graph state, bounding it so a pathological state cannot bloat a row."""
+    encoded = json.dumps(dict(state), ensure_ascii=False)
+    if len(encoded) <= MAX_TRACE_JSON_CHARS:
+        return encoded
+    marker = {
+        "truncated": True,
+        "original_chars": len(encoded),
+        "cap_chars": MAX_TRACE_JSON_CHARS,
+    }
+
+    def wrap(head: int) -> str:
+        return json.dumps({**marker, "_trace": encoded[:head]}, ensure_ascii=False)
+
+    # Encoded length grows monotonically with the head size, so bisect for the longest
+    # head that still fits. Escaping quotes in the head make the mapping non-linear.
+    low, high, best = 0, min(len(encoded), MAX_TRACE_JSON_CHARS), 0
+    while low <= high:
+        mid = (low + high) // 2
+        if len(wrap(mid)) <= MAX_TRACE_JSON_CHARS:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return wrap(best)
 
 
 class IncidentMemoryStore:
@@ -23,8 +54,27 @@ class IncidentMemoryStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _session(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection and guarantee it is closed, not merely committed.
+
+        ``with sqlite3.connect(...) as conn`` commits or rolls back the transaction but
+        leaves the file descriptor open, so a polling watchdog leaks one fd per store
+        call until the garbage collector happens to reclaim it.
+        """
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_schema(self) -> None:
-        with self._connect() as conn:
+        with self._session() as conn:
+            self._configure_journal(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS incidents (
@@ -48,9 +98,37 @@ class IncidentMemoryStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_incidents_fingerprint ON incidents(fingerprint)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS capability_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    incident_row_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    missing_capability TEXT NOT NULL,
+                    proposed_playbook_id TEXT NOT NULL,
+                    proposed_feature_spec TEXT NOT NULL,
+                    agent_prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+    @staticmethod
+    def _configure_journal(conn: sqlite3.Connection) -> None:
+        """Enable WAL so the watch loop can write while the CLI reads history."""
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.DatabaseError:
+            pass
 
     def find_successful_fixes(self, fingerprint: str, *, limit: int = 3) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        """Return up to ``limit`` previously executed and resolved incidents for a fingerprint."""
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT incident_id, fingerprint, playbook_id, safety_tier, triage_provider, created_at
@@ -64,15 +142,18 @@ class IncidentMemoryStore:
             return [dict(row) for row in rows]
 
     def record_state(self, state: HealerGraphState) -> int:
+        """Persist one incident row from a healer graph state and return its new row id."""
         symptom = state.get("symptom") or {}
         triage = state.get("triage") or {}
         diagnosis = state.get("diagnosis") or {}
         plan = state.get("plan") or {}
         execution = state.get("execution") or {}
         verification = state.get("verification") or {}
+        escalation = state.get("escalation") or {}
+        encoded_trace = _encode_trace(state)
 
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
+        with self._session() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO incidents (
@@ -103,14 +184,47 @@ class IncidentMemoryStore:
                     1 if execution.get("executed") else 0,
                     1 if verification.get("resolved") else 0,
                     str(state.get("status") or "completed"),
-                    json.dumps(dict(state), ensure_ascii=False),
+                    encoded_trace,
                     now,
                 ),
             )
-            return int(cursor.lastrowid or 0)
+            row_id = int(cursor.lastrowid or 0)
+            if isinstance(escalation, dict) and escalation.get("agent_prompt"):
+                conn.execute(
+                    """
+                    INSERT INTO capability_requests (
+                        incident_row_id,
+                        fingerprint,
+                        domain,
+                        title,
+                        reason,
+                        provider,
+                        missing_capability,
+                        proposed_playbook_id,
+                        proposed_feature_spec,
+                        agent_prompt,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row_id,
+                        str(symptom.get("fingerprint") or "unknown"),
+                        str(symptom.get("domain") or "other"),
+                        str(symptom.get("title") or ""),
+                        str(escalation.get("reason") or "remediation_failed"),
+                        str(escalation.get("provider") or "heuristic"),
+                        str(escalation.get("missing_capability") or ""),
+                        str(escalation.get("proposed_playbook_id") or ""),
+                        str(escalation.get("proposed_feature_spec") or ""),
+                        str(escalation.get("agent_prompt") or ""),
+                        now,
+                    ),
+                )
+            return row_id
 
     def recent_incidents(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        """Return the most recent incident rows, newest first, capped at ``limit``."""
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT id, incident_id, fingerprint, domain, title,
@@ -123,3 +237,37 @@ class IncidentMemoryStore:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def recent_escalations(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return the most recent capability escalation requests, newest first."""
+        with self._session() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, incident_row_id, fingerprint, domain, title,
+                       reason, provider, missing_capability,
+                       proposed_playbook_id, proposed_feature_spec,
+                       agent_prompt, created_at
+                FROM capability_requests
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_escalation(self, escalation_id: int) -> dict[str, Any] | None:
+        """Fetch a single capability escalation request by ID."""
+        with self._session() as conn:
+            row = conn.execute(
+                """
+                SELECT id, incident_row_id, fingerprint, domain, title,
+                       reason, provider, missing_capability,
+                       proposed_playbook_id, proposed_feature_spec,
+                       agent_prompt, created_at
+                FROM capability_requests
+                WHERE id = ?
+                """,
+                (escalation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
